@@ -174,7 +174,8 @@ Requirements:
 - Return only valid JSON.
 - Generate each day with 2-${Math.max(2, constraints.maxPlacesPerDay)} places.
 - Include practical sequencing between places.
-- Keep the total trip budget as close as possible to the given budget without exceeding it.
+- Minimize the planned spend while preserving a rich, satisfying traveler experience.
+- Hard constraint: the final plannedBudget must never exceed the given total budget.
 - Distribute accommodation realistically across all days (do not put full stay cost in one day).
 - Balance day budgets so daily spending feels natural.
 - Include detailed cultural and historical descriptions for each place.
@@ -196,6 +197,8 @@ Requirements:
 - For longer trips, include multiple complementary destinations only when budget/time constraints allow.
 - If constraints are tight, prioritize top-relevance nearby destinations and skip weaker ones.
 - Avoid overloading any single day when adding nearby destinations.
+- Do not mention specific hotel/resort/hostel names anywhere in the plan.
+- For any accommodation stop, use this format only: "Check-In into hotel at <area/place>".
 
 Output schema:
 {
@@ -294,7 +297,8 @@ ${compactPlan}
 Replanning goals:
 - Replace skipped/unavailable places with suitable alternatives.
 - Adapt scheduling for weather or time constraints.
-- Preserve budget and balanced day-wise spending.
+- Preserve budget and balanced day-wise spending, while minimizing unnecessary cost.
+- Hard constraint: the replanned itinerary must never exceed the budget limit.
 - Keep nearby places grouped and reduce travel backtracking.
 - Keep recommendations aligned with food preference.
 - If transport access type is own, travelModeFromPrevious must be only "cab" or "walk".
@@ -304,6 +308,8 @@ Replanning goals:
 - Preserve must-visit places as much as possible.
 - Maintain complementary nearby destinations where feasible after replanning.
 - Keep fares and budgets realistic for ${logistics.passengerCount} passenger(s).
+- Do not mention specific hotel/resort/hostel names anywhere in the plan.
+- For any accommodation stop, use this format only: "Check-In into hotel at <area/place>".
 
 Return ONLY JSON in the same schema as the itinerary generator.
 Include updated "whyThisPlan" to explain changes.

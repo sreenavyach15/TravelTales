@@ -1,8 +1,18 @@
-import { addDoc, collection, getDocs, query, serverTimestamp, where } from 'firebase/firestore'
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  query,
+  serverTimestamp,
+  where,
+} from 'firebase/firestore'
 import { db } from '../firebase/config'
 import { getChatRoomByTripId, listUserChatRooms } from './chatService'
 import { getOngoingTrips, getTripById } from './tripService'
-import { uploadPhoto } from './uploadPhoto'
+import { deletePhotoByPath, uploadPhoto } from './uploadPhoto'
 import { getDisplayNameFromEmail, getUserProfileByUid, normalizeEmail, resolveDisplayName } from './userService'
 
 function getDbInstance() {
@@ -40,7 +50,7 @@ async function getTripAlbumAccess({ tripId, userId }) {
     return { trip, room: null, accessRole: 'owner' }
   }
 
-  const room = await getChatRoomByTripId(tripId)
+  const room = await getChatRoomByTripId(tripId, userId)
   const memberUids = Array.isArray(room?.memberUids) ? room.memberUids : []
   if (memberUids.includes(userId)) {
     return { trip, room, accessRole: 'traveler' }
@@ -113,19 +123,33 @@ export async function listTripAlbumPhotos({ tripId, userId }) {
 }
 
 export async function uploadTripAlbumPhoto({ tripId, user, file, caption }) {
+  const uploaded = await uploadTripAlbumPhotos({
+    tripId,
+    user,
+    files: [file],
+    caption,
+  })
+
+  return uploaded[0]
+}
+
+export async function uploadTripAlbumPhotos({ tripId, user, files, caption }) {
   if (!user?.uid || !user?.email) {
     throw new Error('You must be logged in to upload photos.')
   }
-  if (!file) {
-    throw new Error('Please choose a photo to upload.')
+  const normalizedFiles = Array.isArray(files)
+    ? files
+    : Array.from(files || []).filter(Boolean)
+
+  if (normalizedFiles.length === 0) {
+    throw new Error('Please choose at least one photo to upload.')
   }
 
   const { trip } = await getTripAlbumAccess({ tripId, userId: user.uid })
   const database = getDbInstance()
-
-  const uploadedFile = await uploadPhoto(file, {
-    fileNamePrefix: `trip-${tripId}`,
-  })
+  const trimmedCaption = String(caption || '')
+    .trim()
+    .slice(0, 300)
 
   const profile = await getUserProfileByUid(user.uid)
   const uploadedByName = resolveDisplayName({
@@ -133,23 +157,63 @@ export async function uploadTripAlbumPhoto({ tripId, user, file, caption }) {
     email: user.email,
   })
 
-  const payload = {
-    tripId,
-    destination: String(trip.destination || ''),
-    publicUrl: uploadedFile.publicUrl,
-    storagePath: uploadedFile.storagePath,
-    uploadedByUid: user.uid,
-    uploadedByEmail: normalizeEmail(user.email),
-    uploadedByName: uploadedByName || getDisplayNameFromEmail(user.email),
-    caption: String(caption || '')
-      .trim()
-      .slice(0, 300),
-    createdAt: serverTimestamp(),
+  const uploadedEntries = []
+  for (const file of normalizedFiles) {
+    const uploadedFile = await uploadPhoto(file, {
+      pathPrefix: `trip-${tripId}`,
+      fileNamePrefix: `trip-${tripId}`,
+    })
+
+    const payload = {
+      tripId,
+      destination: String(trip.destination || ''),
+      publicUrl: uploadedFile.publicUrl,
+      storagePath: uploadedFile.storagePath,
+      uploadedByUid: user.uid,
+      uploadedByEmail: normalizeEmail(user.email),
+      uploadedByName: uploadedByName || getDisplayNameFromEmail(user.email),
+      caption: trimmedCaption,
+      createdAt: serverTimestamp(),
+    }
+
+    const docRef = await addDoc(collection(database, 'tripPhotos'), payload)
+    uploadedEntries.push({
+      id: docRef.id,
+      ...payload,
+    })
   }
 
-  const docRef = await addDoc(collection(database, 'tripPhotos'), payload)
-  return {
-    id: docRef.id,
-    ...payload,
+  return uploadedEntries
+}
+
+export async function deleteTripAlbumPhoto({ tripId, photoId, userId }) {
+  if (!userId) {
+    throw new Error('You must be logged in to delete photos.')
   }
+  if (!tripId || !photoId) {
+    throw new Error('Trip and photo are required.')
+  }
+
+  const { accessRole } = await getTripAlbumAccess({ tripId, userId })
+  const database = getDbInstance()
+  const photoRef = doc(database, 'tripPhotos', photoId)
+  const snapshot = await getDoc(photoRef)
+
+  if (!snapshot.exists()) {
+    throw new Error('Photo not found.')
+  }
+
+  const photo = snapshot.data() || {}
+  if (photo.tripId !== tripId) {
+    throw new Error('Photo does not belong to the selected trip.')
+  }
+
+  const isTripOwner = accessRole === 'owner'
+  const isUploader = String(photo.uploadedByUid || '') === String(userId || '')
+  if (!isTripOwner && !isUploader) {
+    throw new Error('Only the trip owner or uploader can delete this photo.')
+  }
+
+  await deletePhotoByPath(photo.storagePath)
+  await deleteDoc(photoRef)
 }

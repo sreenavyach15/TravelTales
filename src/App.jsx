@@ -12,6 +12,7 @@ import PhotoAlbum from './pages/PhotoAlbum'
 import Recommendations from './pages/Recommendations'
 import Signup from './pages/Signup'
 import TravelDiary from './pages/TravelDiary'
+import TripTracker from './pages/TripTracker'
 import TripDetails from './pages/TripDetails'
 
 function App() {
@@ -41,6 +42,7 @@ function App() {
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/create-trip" element={<CreateTrip />} />
             <Route path="/trip" element={<TripDetails />} />
+            <Route path="/trip-tracker" element={<TripTracker />} />
             <Route path="/expenses" element={<ExpenseTracker />} />
             <Route path="/chat" element={<ChatRoom />} />
             <Route path="/diary" element={<TravelDiary />} />

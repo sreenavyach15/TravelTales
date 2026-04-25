@@ -204,17 +204,16 @@ function normalizeConstraints(tripInput) {
   }
 }
 
-export async function createTrip(userId, tripInput) {
-  const database = getDbInstance()
+function buildTripPayload(userId, tripInput) {
   const preferences = normalizePreferences(tripInput)
   const constraints = normalizeConstraints(tripInput)
   const passengerCount = normalizePassengerCount(tripInput.passengerCount)
   const budgetPerHead = normalizeNonNegativeNumber(tripInput.budgetPerHead ?? tripInput.budget)
   const totalBudget = normalizeNonNegativeNumber(budgetPerHead * passengerCount)
 
-  const payload = {
+  return {
     userId,
-    destination: tripInput.destination.trim(),
+    destination: String(tripInput.destination || '').trim(),
     startDate: tripInput.startDate || '',
     endDate: tripInput.endDate || '',
     arrivalTime: normalizeTimeValue(tripInput.arrivalTime),
@@ -229,9 +228,18 @@ export async function createTrip(userId, tripInput) {
     mustVisitPlaces: preferences.mustVisitPlaces,
     foodPreference: preferences.foodPreference,
     pace: preferences.pace,
+  }
+}
+
+export async function createTrip(userId, tripInput) {
+  const database = getDbInstance()
+  const normalizedBase = buildTripPayload(userId, tripInput)
+  const payload = {
+    ...normalizedBase,
     status: 'ongoing',
     itinerary: [],
     createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
   }
 
   const docRef = await addDoc(collection(database, 'trips'), payload)
@@ -257,6 +265,27 @@ export async function getOngoingTrips(userId) {
     })
 }
 
+export async function getTripsByUser(userId) {
+  if (!userId) {
+    return []
+  }
+
+  const database = getDbInstance()
+  const tripsQuery = query(collection(database, 'trips'), where('userId', '==', userId))
+  const snapshot = await getDocs(tripsQuery)
+
+  return snapshot.docs
+    .map((tripDoc) => ({
+      id: tripDoc.id,
+      ...tripDoc.data(),
+    }))
+    .sort((firstTrip, secondTrip) => {
+      const firstTime = firstTrip.createdAt?.toMillis?.() ?? 0
+      const secondTime = secondTrip.createdAt?.toMillis?.() ?? 0
+      return secondTime - firstTime
+    })
+}
+
 export async function getTripById(tripId) {
   const database = getDbInstance()
   const tripRef = doc(database, 'trips', tripId)
@@ -275,7 +304,38 @@ export async function getTripById(tripId) {
 export async function saveTripItinerary(tripId, itinerary) {
   const database = getDbInstance()
   const tripRef = doc(database, 'trips', tripId)
-  await updateDoc(tripRef, { itinerary })
+  await updateDoc(tripRef, { itinerary, updatedAt: serverTimestamp() })
+}
+
+export async function updateTripIfItineraryNotGenerated({ tripId, userId, tripInput }) {
+  const normalizedTripId = String(tripId || '').trim()
+  if (!normalizedTripId) {
+    throw new Error('Trip id is required.')
+  }
+
+  const database = getDbInstance()
+  const tripRef = doc(database, 'trips', normalizedTripId)
+  const snapshot = await getDoc(tripRef)
+
+  if (!snapshot.exists()) {
+    throw new Error('Trip not found.')
+  }
+
+  const existingTrip = snapshot.data()
+  if (existingTrip.userId !== userId) {
+    throw new Error('You are not allowed to edit this trip.')
+  }
+
+  const hasPlan = Array.isArray(existingTrip?.itinerary?.days) && existingTrip.itinerary.days.length > 0
+  if (hasPlan) {
+    throw new Error('Trip details cannot be edited after itinerary is generated.')
+  }
+
+  const normalizedBase = buildTripPayload(userId, tripInput)
+  await updateDoc(tripRef, {
+    ...normalizedBase,
+    updatedAt: serverTimestamp(),
+  })
 }
 
 export async function deleteTripIfAllowed({ tripId, userId }) {

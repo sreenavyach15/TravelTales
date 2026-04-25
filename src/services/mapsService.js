@@ -1,52 +1,126 @@
-const googleMapsApiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY ?? ''
-const placesSearchEndpoint = 'https://places.googleapis.com/v1/places:searchText'
-const coordinateCache = new Map()
+const EXACT_NON_LOCATION_LABELS = new Set([
+  'breakfast',
+  'lunch',
+  'dinner',
+  'brunch',
+  'snack',
+  'snacks',
+  'meal',
+  'rest',
+  'relax',
+  'relaxation',
+  'free time',
+  'leisure',
+  'leisure time',
+  'hotel check-in',
+  'hotel check in',
+  'check-in',
+  'check in',
+  'hotel check-out',
+  'hotel check out',
+  'check-out',
+  'check out',
+  'hotel stay',
+  'stay at hotel',
+])
 
-export async function getCoordinates(placeName) {
-  const query = String(placeName || '').trim()
-  if (!query) {
-    throw new Error('Place name is required.')
+const LOCATION_HINT_KEYWORDS = [
+  'beach',
+  'temple',
+  'museum',
+  'fort',
+  'palace',
+  'landmark',
+  'airport',
+  'station',
+  'city',
+  'town',
+  'village',
+  'lake',
+  'falls',
+  'waterfall',
+  'park',
+  'garden',
+  'sanctuary',
+  'zoo',
+  'island',
+  'market',
+  'bazaar',
+  'mall',
+  'street',
+  'cafe',
+  'restaurant',
+  'monument',
+  'point',
+  'bridge',
+  'harbor',
+  'harbour',
+  'church',
+  'mosque',
+  'gurdwara',
+  'stupa',
+  'ashram',
+]
+
+const SHOPPING_TERMS = ['shopping', 'shop around', 'souvenir']
+const MEAL_TERMS = ['breakfast', 'lunch', 'dinner', 'brunch', 'snack', 'meal']
+
+function normalizeLabel(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function hasAnyKeyword(value, keywords) {
+  return keywords.some((keyword) => value.includes(keyword))
+}
+
+export function isNavigableLocation(place) {
+  const rawLabel =
+    typeof place === 'string'
+      ? String(place || '').trim()
+      : String(place?.name || '').trim()
+
+  if (!rawLabel) {
+    return false
   }
 
-  if (!googleMapsApiKey) {
-    throw new Error('Google Maps API key missing. Add VITE_GOOGLE_MAPS_API_KEY in .env.')
+  const label = normalizeLabel(rawLabel)
+  if (!label) {
+    return false
   }
 
-  const cacheKey = query.toLowerCase()
-  if (coordinateCache.has(cacheKey)) {
-    return coordinateCache.get(cacheKey)
+  if (EXACT_NON_LOCATION_LABELS.has(label)) {
+    return false
   }
 
-  const response = await fetch(placesSearchEndpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Goog-Api-Key': googleMapsApiKey,
-      'X-Goog-FieldMask': 'places.displayName,places.location',
-    },
-    body: JSON.stringify({
-      textQuery: query,
-      maxResultCount: 1,
-    }),
-  })
+  const hasLocationHint = hasAnyKeyword(label, LOCATION_HINT_KEYWORDS)
+  const hasMealTerm = hasAnyKeyword(label, MEAL_TERMS)
+  const hasShoppingTerm = hasAnyKeyword(label, SHOPPING_TERMS)
 
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Places API request failed (${response.status}): ${errorText}`)
+  if (/\b(check[\s-]*in|check[\s-]*out)\b/.test(label)) {
+    return false
   }
 
-  const data = await response.json()
-  const firstMatch = data?.places?.[0]
-  const lat = Number(firstMatch?.location?.latitude)
-  const lng = Number(firstMatch?.location?.longitude)
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    throw new Error(`No coordinates found for "${query}".`)
+  if (/\b(rest|relax|relaxation|free time|leisure)\b/.test(label)) {
+    return false
   }
 
-  const coordinates = { lat, lng }
-  coordinateCache.set(cacheKey, coordinates)
-  return coordinates
+  if (/\b(hotel|stay|accommodation)\b/.test(label) && !hasLocationHint) {
+    return false
+  }
+
+  if (hasMealTerm && !hasLocationHint) {
+    return false
+  }
+
+  if (hasShoppingTerm && !hasLocationHint) {
+    return false
+  }
+
+  return true
 }
 
 export function openInGoogleMaps(place) {

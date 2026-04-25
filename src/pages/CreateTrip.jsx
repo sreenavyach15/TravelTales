@@ -1,8 +1,8 @@
-import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useEffect, useMemo, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import PageContainer from '../components/PageContainer'
 import { useAuth } from '../hooks/useAuth'
-import { createTrip } from '../services/tripService'
+import { createTrip, getTripById, updateTripIfItineraryNotGenerated } from '../services/tripService'
 
 const INTEREST_OPTIONS = [
   { label: 'Beach', value: 'beach' },
@@ -71,6 +71,9 @@ function ChoiceChips({ options, selectedValue, onSelect }) {
 function CreateTrip() {
   const { user } = useAuth()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const editTripId = searchParams.get('tripId')
+  const isEditMode = useMemo(() => Boolean(editTripId), [editTripId])
   const [trip, setTrip] = useState({
     destination: '',
     startDate: '',
@@ -101,12 +104,104 @@ function CreateTrip() {
     },
   })
   const [message, setMessage] = useState('')
+  const [loadingEditTrip, setLoadingEditTrip] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [showAdvancedOptions, setShowAdvancedOptions] = useState(false)
   const [showConstraints, setShowConstraints] = useState(false)
   const passengerCount = Math.max(1, Number(trip.passengerCount || 1))
   const budgetPerHead = Math.max(0, Number(trip.budgetPerHead || 0))
   const totalBudget = Math.round(passengerCount * budgetPerHead)
+
+  useEffect(() => {
+    let isMounted = true
+
+    async function loadTripForEdit() {
+      if (!isEditMode || !editTripId || !user?.uid) {
+        return
+      }
+
+      setLoadingEditTrip(true)
+      setMessage('')
+
+      try {
+        const existingTrip = await getTripById(editTripId)
+        if (!existingTrip) {
+          throw new Error('Trip not found.')
+        }
+        if (existingTrip.userId !== user.uid) {
+          throw new Error('You are not allowed to edit this trip.')
+        }
+
+        const hasSavedPlan =
+          Array.isArray(existingTrip?.itinerary?.days) && existingTrip.itinerary.days.length > 0
+        if (hasSavedPlan) {
+          throw new Error('Trip details cannot be edited after itinerary is generated.')
+        }
+
+        if (!isMounted) return
+
+        setTrip({
+          destination: existingTrip.destination || '',
+          startDate: existingTrip.startDate || '',
+          endDate: existingTrip.endDate || '',
+          arrivalTime: existingTrip.arrivalTime || '',
+          departureTime: existingTrip.departureTime || '',
+          passengerCount: String(existingTrip.passengerCount || 1),
+          budgetPerHead: String(existingTrip.budgetPerHead || ''),
+          preferences: {
+            travelStyle: existingTrip?.preferences?.travelStyle || existingTrip.travelStyle || 'balanced',
+            transportOwnership:
+              existingTrip?.preferences?.transportOwnership || existingTrip.transportOwnership || 'public',
+            pace: existingTrip?.preferences?.pace || existingTrip.pace || 'moderate',
+            interests: Array.isArray(existingTrip?.preferences?.interests)
+              ? existingTrip.preferences.interests
+              : Array.isArray(existingTrip?.interests)
+                ? existingTrip.interests
+                : [],
+            mustVisitPlaces: Array.isArray(existingTrip?.preferences?.mustVisitPlaces)
+              ? existingTrip.preferences.mustVisitPlaces.join(', ')
+              : Array.isArray(existingTrip?.mustVisitPlaces)
+                ? existingTrip.mustVisitPlaces.join(', ')
+                : existingTrip?.preferences?.mustVisitPlaces || existingTrip.mustVisitPlaces || '',
+            foodPreference:
+              existingTrip?.preferences?.foodPreference || existingTrip.foodPreference || 'veg',
+            crowdTolerance:
+              existingTrip?.preferences?.crowdTolerance || existingTrip.crowdTolerance || 'medium',
+            advancedOptions: {
+              hotelBudgetPerNight: String(
+                existingTrip?.preferences?.advancedOptions?.hotelBudgetPerNight ?? '',
+              ),
+              foodBudgetPerDay: String(
+                existingTrip?.preferences?.advancedOptions?.foodBudgetPerDay ?? '',
+              ),
+              activityBudgetPerDay: String(
+                existingTrip?.preferences?.advancedOptions?.activityBudgetPerDay ?? '',
+              ),
+            },
+          },
+          constraints: {
+            maxTravelTimePerDay: String(existingTrip?.constraints?.maxTravelTimePerDay ?? '6'),
+            maxPlacesPerDay: String(existingTrip?.constraints?.maxPlacesPerDay ?? '4'),
+            restTimeRequired: Boolean(existingTrip?.constraints?.restTimeRequired),
+            weatherSensitive: Boolean(existingTrip?.constraints?.weatherSensitive),
+          },
+        })
+      } catch (loadError) {
+        if (isMounted) {
+          setMessage(loadError.message)
+        }
+      } finally {
+        if (isMounted) {
+          setLoadingEditTrip(false)
+        }
+      }
+    }
+
+    loadTripForEdit()
+    return () => {
+      isMounted = false
+    }
+  }, [editTripId, isEditMode, user?.uid])
 
   const handleChange = (event) => {
     const { name, value } = event.target
@@ -189,8 +284,17 @@ function CreateTrip() {
 
     setIsSubmitting(true)
     try {
-      await createTrip(user.uid, trip)
-      setMessage(`Trip to ${trip.destination || 'your destination'} created.`)
+      if (isEditMode && editTripId) {
+        await updateTripIfItineraryNotGenerated({
+          tripId: editTripId,
+          userId: user.uid,
+          tripInput: trip,
+        })
+        setMessage(`Trip to ${trip.destination || 'your destination'} updated.`)
+      } else {
+        await createTrip(user.uid, trip)
+        setMessage(`Trip to ${trip.destination || 'your destination'} created.`)
+      }
       navigate('/trip')
     } catch (error) {
       setMessage(error.message)
@@ -200,7 +304,19 @@ function CreateTrip() {
   }
 
   return (
-    <PageContainer title="CreateTrip" description="Capture your travel plan details in one place.">
+    <PageContainer
+      title={isEditMode ? 'EditTrip' : 'CreateTrip'}
+      description={
+        isEditMode
+          ? 'Update trip details before itinerary generation.'
+          : 'Capture your travel plan details in one place.'
+      }
+    >
+      {loadingEditTrip && (
+        <p className="mb-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+          Loading trip details...
+        </p>
+      )}
       <form className="grid gap-4 sm:grid-cols-2" onSubmit={handleSubmit}>
         <label className="text-sm font-medium text-slate-700">
           Destination
@@ -513,10 +629,10 @@ function CreateTrip() {
         <div className="sm:col-span-2">
           <button
             type="submit"
-            disabled={isSubmitting}
+            disabled={isSubmitting || loadingEditTrip}
             className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
           >
-            {isSubmitting ? 'Saving...' : 'Save Trip'}
+            {isSubmitting ? 'Saving...' : isEditMode ? 'Update Trip' : 'Save Trip'}
           </button>
           {message && <p className="mt-2 text-sm text-slate-600">{message}</p>}
         </div>

@@ -1,10 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import MapView from '../components/MapView'
 import PageContainer from '../components/PageContainer'
 import { useAuth } from '../hooks/useAuth'
 import { getChatRoomByTripId } from '../services/chatService'
-import { getCoordinates, openInGoogleMaps } from '../services/mapsService'
+import { isNavigableLocation, openInGoogleMaps } from '../services/mapsService'
 import { canDeleteTrip, deleteTripIfAllowed, getOngoingTrips } from '../services/tripService'
 
 function TripDetails() {
@@ -17,10 +16,6 @@ function TripDetails() {
   const [chatRoomByTripId, setChatRoomByTripId] = useState({})
   const [selectedMapTripId, setSelectedMapTripId] = useState('')
   const [selectedMapDayId, setSelectedMapDayId] = useState('all')
-  const [mapPlaces, setMapPlaces] = useState([])
-  const [mapLoading, setMapLoading] = useState(false)
-  const [mapError, setMapError] = useState('')
-  const [focusedMapPlaceName, setFocusedMapPlaceName] = useState('')
 
   const formatFoodPreferenceLabel = (trip) => {
     const value = String(trip?.preferences?.foodPreference || trip?.foodPreference || 'veg')
@@ -72,7 +67,7 @@ function TripDetails() {
         const roomEntries = await Promise.all(
           ongoingTrips.map(async (trip) => {
             try {
-              const room = await getChatRoomByTripId(trip.id)
+              const room = await getChatRoomByTripId(trip.id, user.uid)
               return [trip.id, room?.id || '']
             } catch {
               return [trip.id, '']
@@ -170,67 +165,6 @@ function TripDetails() {
       setSelectedMapDayId('all')
     }
   }, [selectedMapTrip, selectedMapDayId])
-
-  useEffect(() => {
-    let isMounted = true
-
-    async function loadMapPlaces() {
-      const destination = String(selectedMapTrip?.destination || '').trim()
-      const uniqueNames = [...new Set(
-        selectedMapPlaces
-          .map((place) => String(place?.name || '').trim())
-          .filter(Boolean),
-      )]
-
-      if (uniqueNames.length === 0) {
-        if (isMounted) {
-          setMapPlaces([])
-          setMapError('')
-          setMapLoading(false)
-        }
-        return
-      }
-
-      setMapLoading(true)
-      setMapError('')
-
-      const resolved = await Promise.allSettled(
-        uniqueNames.map(async (name) => {
-          const coordinates = await getCoordinates(destination ? `${name}, ${destination}` : name)
-          return { name, ...coordinates }
-        }),
-      )
-
-      if (!isMounted) {
-        return
-      }
-
-      const success = resolved
-        .filter((item) => item.status === 'fulfilled')
-        .map((item) => item.value)
-      const failedCount = resolved.filter((item) => item.status === 'rejected').length
-
-      setMapPlaces(success)
-      setMapLoading(false)
-      setMapError(failedCount > 0 ? `Could not map ${failedCount} place(s).` : '')
-    }
-
-    loadMapPlaces().catch((loadError) => {
-      if (isMounted) {
-        setMapLoading(false)
-        setMapError(loadError.message)
-      }
-    })
-
-    return () => {
-      isMounted = false
-    }
-  }, [selectedMapPlaces, selectedMapTrip])
-
-  const handleViewOnMap = (dayId, placeName) => {
-    setSelectedMapDayId(dayId || 'all')
-    setFocusedMapPlaceName(String(placeName || '').trim())
-  }
 
   const handleNavigate = (placeName) => {
     openInGoogleMaps(placeName)
@@ -347,6 +281,15 @@ function TripDetails() {
                     </Link>
                   )}
 
+                  {!trip.itinerary?.days?.length && (
+                    <Link
+                      to={`/create-trip?tripId=${trip.id}`}
+                      className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                    >
+                      Edit Trip
+                    </Link>
+                  )}
+
                   {canDeleteTrip(trip) ? (
                     <button
                       type="button"
@@ -370,14 +313,14 @@ function TripDetails() {
 
       {!loading && !error && (
         <section className="mt-6 space-y-4 rounded-lg border border-slate-200 bg-white p-4">
-          <h3 className="text-lg font-semibold text-slate-900">Trip Map & Route</h3>
+          <h3 className="text-lg font-semibold text-slate-900">Trip Places & Navigation</h3>
           <p className="text-sm text-slate-600">
-            Explore saved itinerary places on the map and navigate directly.
+            View saved itinerary places and open each location in Google Maps.
           </p>
 
           {mappableTrips.length === 0 ? (
             <p className="rounded-md border border-dashed border-slate-300 p-3 text-sm text-slate-600">
-              Save a trip plan to enable map routing.
+              Save a trip plan to enable place navigation.
             </p>
           ) : (
             <>
@@ -389,7 +332,6 @@ function TripDetails() {
                     onClick={() => {
                       setSelectedMapTripId(trip.id)
                       setSelectedMapDayId('all')
-                      setFocusedMapPlaceName('')
                     }}
                     className={`rounded-md px-3 py-1.5 text-sm font-medium ${
                       selectedMapTrip?.id === trip.id
@@ -431,31 +373,21 @@ function TripDetails() {
                       <p className="text-sm font-medium text-slate-800">
                         {index + 1}. {place.name || 'Unnamed Place'}
                       </p>
-                      <div className="flex gap-2">
-                        <button
-                          type="button"
-                          onClick={() => handleViewOnMap(place.dayId, place.name)}
-                          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
-                        >
-                          View on Map
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleNavigate(place.name)}
-                          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
-                        >
-                          Navigate
-                        </button>
-                      </div>
+                      {isNavigableLocation(place) && (
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleNavigate(place.name)}
+                            className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                          >
+                            Navigate
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ))
                 )}
               </div>
-
-              {mapLoading && <p className="text-sm text-slate-600">Loading coordinates...</p>}
-              {mapError && <p className="text-sm text-amber-700">{mapError}</p>}
-
-              <MapView places={mapPlaces} focusedPlaceName={focusedMapPlaceName} />
             </>
           )}
         </section>

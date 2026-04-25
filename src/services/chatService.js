@@ -16,10 +16,10 @@ import {
 } from 'firebase/firestore'
 import { db } from '../firebase/config'
 import { validateEmail } from './authValidation'
+import { ensureSupabaseSession, supabase } from './supabaseClient'
 import {
   getDisplayNameFromEmail,
   getUserProfileByEmail,
-  getUserProfileByUid,
   normalizeEmail,
 } from './userService'
 
@@ -29,6 +29,74 @@ function getDbInstance() {
   }
 
   return db
+}
+
+export const CHAT_FILE_SIZE_LIMIT_BYTES = 10 * 1024 * 1024
+export const CHAT_FILE_SIZE_LIMIT_MB = CHAT_FILE_SIZE_LIMIT_BYTES / (1024 * 1024)
+const CHAT_FILES_BUCKET = 'chat-files'
+
+function sanitizeFileName(fileName) {
+  return String(fileName || 'file')
+    .replace(/[^\w.\-() ]+/g, '_')
+    .slice(0, 120)
+}
+
+async function uploadChatAttachment({ roomId, userId, file }) {
+  if (!file) {
+    return null
+  }
+  if (file.size > CHAT_FILE_SIZE_LIMIT_BYTES) {
+    throw new Error(`File exceeds ${CHAT_FILE_SIZE_LIMIT_MB} MB limit.`)
+  }
+  if (!supabase) {
+    throw new Error('Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.')
+  }
+
+  await ensureSupabaseSession()
+  const safeName = sanitizeFileName(file.name)
+  const objectPath = `chatRooms/${roomId}/${Date.now()}-${safeName}`
+
+  let uploadError = null
+  try {
+    const uploadResult = await supabase.storage.from(CHAT_FILES_BUCKET).upload(objectPath, file, {
+      cacheControl: '3600',
+      upsert: false,
+      contentType: file.type || 'application/octet-stream',
+    })
+    uploadError = uploadResult.error
+  } catch (error) {
+    if (error instanceof TypeError && String(error.message || '').toLowerCase().includes('fetch')) {
+      throw new Error(
+        'Failed to reach Supabase Storage. Check internet connection, VITE_SUPABASE_URL, and bucket policies.',
+      )
+    }
+    throw error
+  }
+
+  if (uploadError) {
+    const message = String(uploadError.message || '')
+    if (message.toLowerCase().includes('row-level security policy')) {
+      throw new Error(
+        'Supabase blocked upload by RLS policy. Allow authenticated inserts for bucket "chat-files".',
+      )
+    }
+    throw new Error(uploadError.message)
+  }
+
+  const { data } = supabase.storage.from(CHAT_FILES_BUCKET).getPublicUrl(objectPath)
+  const fileUrl = data?.publicUrl || ''
+  if (!fileUrl) {
+    throw new Error('Unable to resolve public URL for uploaded chat file.')
+  }
+
+  return {
+    fileUrl,
+    fileName: safeName,
+    fileSize: Number(file.size || 0),
+    fileType: String(file.type || '').trim(),
+    storagePath: objectPath,
+    uploaderUid: userId,
+  }
 }
 
 function parseInviteEmails(inviteEmails) {
@@ -95,13 +163,18 @@ async function resolveInviteTargets({ inviteEmails, currentUser, existingMemberE
   }
 }
 
-export async function getChatRoomByTripId(tripId) {
-  if (!tripId) {
+export async function getChatRoomByTripId(tripId, userId) {
+  if (!tripId || !userId) {
     return null
   }
 
   const database = getDbInstance()
-  const roomsQuery = query(collection(database, 'chatRooms'), where('tripId', '==', tripId), limit(1))
+  const roomsQuery = query(
+    collection(database, 'chatRooms'),
+    where('tripId', '==', tripId),
+    where('memberUids', 'array-contains', userId),
+    limit(1),
+  )
   const snapshot = await getDocs(roomsQuery)
 
   if (snapshot.empty) {
@@ -126,7 +199,6 @@ async function upsertInvite({
 }) {
   const database = getDbInstance()
   const inviteRef = doc(database, 'chatInvites', `${roomId}_${inviteeUid}`)
-  const existingInvite = await getDoc(inviteRef)
 
   const payload = {
     roomId,
@@ -138,17 +210,10 @@ async function upsertInvite({
     inviteeEmail: normalizeEmail(inviteeEmail),
     status: 'pending',
     updatedAt: serverTimestamp(),
-  }
-
-  if (existingInvite.exists()) {
-    await setDoc(inviteRef, payload, { merge: true })
-    return
-  }
-
-  await setDoc(inviteRef, {
-    ...payload,
     createdAt: serverTimestamp(),
-  })
+  }
+
+  await setDoc(inviteRef, payload, { merge: true })
 }
 
 export async function createChatRoomForTrip({ trip, adminUser, groupName, inviteEmails }) {
@@ -167,7 +232,7 @@ export async function createChatRoomForTrip({ trip, adminUser, groupName, invite
     throw new Error('Group name is required.')
   }
 
-  const existingRoom = await getChatRoomByTripId(trip.id)
+  const existingRoom = await getChatRoomByTripId(trip.id, adminUser.uid)
   if (existingRoom) {
     throw new Error('Chat room already exists for this trip.')
   }
@@ -339,7 +404,7 @@ export async function acceptChatInvite({ inviteId, user }) {
   return invite.roomId
 }
 
-export async function sendMessageToChatRoom({ roomId, user, text }) {
+export async function sendMessageToChatRoom({ roomId, user, text, file = null, authorName = '' }) {
   if (!roomId) {
     throw new Error('Room is required.')
   }
@@ -348,30 +413,92 @@ export async function sendMessageToChatRoom({ roomId, user, text }) {
   }
 
   const trimmedText = String(text || '').trim()
-  if (!trimmedText) {
+  if (!trimmedText && !file) {
     return
   }
 
-  const userProfile = await getUserProfileByUid(user.uid)
-  const authorName =
-    String(userProfile?.displayName || '').trim() ||
+  const resolvedAuthorName =
+    String(authorName || '').trim() ||
     String(user.displayName || '').trim() ||
     getDisplayNameFromEmail(user.email)
 
   const database = getDbInstance()
-  await addDoc(collection(database, 'chatRooms', roomId, 'messages'), {
-    authorUid: user.uid,
-    authorEmail: normalizeEmail(user.email),
-    authorName,
-    text: trimmedText,
-    createdAt: serverTimestamp(),
+  const attachment = await uploadChatAttachment({
+    roomId,
+    userId: user.uid,
+    file,
   })
 
-  await updateDoc(doc(database, 'chatRooms', roomId), {
-    lastMessageAt: serverTimestamp(),
-    lastMessageAuthorUid: user.uid,
-    updatedAt: serverTimestamp(),
-  })
+  const payload = {
+    authorUid: user.uid,
+    authorEmail: normalizeEmail(user.email),
+    authorName: resolvedAuthorName,
+    text: trimmedText,
+    fileUrl: '',
+    fileName: '',
+    fileSize: 0,
+    fileType: '',
+    timestamp: serverTimestamp(),
+    createdAt: serverTimestamp(),
+  }
+
+  if (attachment) {
+    payload.fileUrl = attachment.fileUrl
+    payload.fileName = attachment.fileName
+    payload.fileSize = attachment.fileSize
+    payload.fileType = attachment.fileType
+    payload.storagePath = attachment.storagePath
+  }
+
+  await Promise.all([
+    addDoc(collection(database, 'chatRooms', roomId, 'messages'), {
+      ...payload,
+    }),
+    updateDoc(doc(database, 'chatRooms', roomId), {
+      lastMessageAt: serverTimestamp(),
+      lastMessageAuthorUid: user.uid,
+      updatedAt: serverTimestamp(),
+    }),
+  ])
+}
+
+export async function sendSystemMessageToChatRoom({ roomId, user, text, metadata = {} }) {
+  if (!roomId) {
+    throw new Error('Room is required.')
+  }
+  if (!user?.uid || !user?.email) {
+    throw new Error('You must be logged in to post system message.')
+  }
+
+  const trimmedText = String(text || '').trim()
+  if (!trimmedText) {
+    return
+  }
+
+  const database = getDbInstance()
+  const payload = {
+    authorUid: user.uid,
+    authorEmail: normalizeEmail(user.email),
+    authorName: 'System',
+    text: trimmedText,
+    fileUrl: '',
+    fileName: '',
+    fileSize: 0,
+    fileType: '',
+    messageType: 'system',
+    metadata: metadata && typeof metadata === 'object' ? metadata : {},
+    timestamp: serverTimestamp(),
+    createdAt: serverTimestamp(),
+  }
+
+  await Promise.all([
+    addDoc(collection(database, 'chatRooms', roomId, 'messages'), payload),
+    updateDoc(doc(database, 'chatRooms', roomId), {
+      lastMessageAt: serverTimestamp(),
+      lastMessageAuthorUid: user.uid,
+      updatedAt: serverTimestamp(),
+    }),
+  ])
 }
 
 export async function markChatRoomAsRead({ roomId, userId }) {

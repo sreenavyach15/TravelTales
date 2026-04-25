@@ -1,6 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import MapView from '../components/MapView'
 import PageContainer from '../components/PageContainer'
 import { useAuth } from '../hooks/useAuth'
 import {
@@ -14,7 +13,7 @@ import {
   generateItineraryFromTrip,
   recalculateItinerary,
 } from '../services/itineraryService'
-import { getCoordinates, openInGoogleMaps } from '../services/mapsService'
+import { isNavigableLocation, openInGoogleMaps } from '../services/mapsService'
 import { downloadItineraryPdf } from '../services/planPdfService'
 import { getTripById, saveTripItinerary } from '../services/tripService'
 
@@ -90,12 +89,6 @@ function Recommendations() {
   const [editSnapshot, setEditSnapshot] = useState(null)
   const [hasSavedPlan, setHasSavedPlan] = useState(false)
   const [suggestingDayId, setSuggestingDayId] = useState('')
-  const [selectedMapDayId, setSelectedMapDayId] = useState('all')
-  const [mapPlaces, setMapPlaces] = useState([])
-  const [mapLoading, setMapLoading] = useState(false)
-  const [mapError, setMapError] = useState('')
-  const [focusedMapPlaceName, setFocusedMapPlaceName] = useState('')
-  const mapSectionRef = useRef(null)
 
   const refreshItinerary = (nextItinerary, tripContext = trip) => {
     const normalized = recalculateItinerary(nextItinerary, tripContext)
@@ -216,114 +209,6 @@ function Recommendations() {
     }
   }, [trip])
 
-  const mapDayOptions = useMemo(() => {
-    const days = itinerary?.days || []
-    return [
-      { id: 'all', label: 'All Days' },
-      ...days.map((day) => ({
-        id: day.id,
-        label: `Day ${day.dayNumber}`,
-      })),
-    ]
-  }, [itinerary?.days])
-
-  const selectedMapDayPlaces = useMemo(() => {
-    const days = itinerary?.days || []
-    if (days.length === 0) {
-      return []
-    }
-
-    if (selectedMapDayId === 'all') {
-      return days.flatMap((day) => day.places || [])
-    }
-
-    const selectedDay = days.find((day) => day.id === selectedMapDayId)
-    return selectedDay?.places || []
-  }, [itinerary?.days, selectedMapDayId])
-
-  useEffect(() => {
-    if (!itinerary?.days?.length) {
-      setSelectedMapDayId('all')
-      return
-    }
-
-    if (selectedMapDayId === 'all') {
-      return
-    }
-
-    const selectedExists = itinerary.days.some((day) => day.id === selectedMapDayId)
-    if (!selectedExists) {
-      setSelectedMapDayId('all')
-    }
-  }, [itinerary?.days, selectedMapDayId])
-
-  useEffect(() => {
-    let isMounted = true
-
-    async function loadMapPlaces() {
-      const destination = String(itinerary?.destination || trip?.destination || '').trim()
-      const placeNames = [...new Set(
-        selectedMapDayPlaces
-          .map((place) => String(place?.name || '').trim())
-          .filter(Boolean),
-      )]
-
-      if (placeNames.length === 0) {
-        if (isMounted) {
-          setMapPlaces([])
-          setMapError('')
-          setMapLoading(false)
-        }
-        return
-      }
-
-      setMapLoading(true)
-      setMapError('')
-
-      const resolved = await Promise.allSettled(
-        placeNames.map(async (name) => {
-          const coordinates = await getCoordinates(
-            destination ? `${name}, ${destination}` : name,
-          )
-          return {
-            name,
-            ...coordinates,
-          }
-        }),
-      )
-
-      if (!isMounted) {
-        return
-      }
-
-      const success = resolved
-        .filter((item) => item.status === 'fulfilled')
-        .map((item) => item.value)
-
-      const failureCount = resolved.filter((item) => item.status === 'rejected').length
-
-      setMapPlaces(success)
-      setMapLoading(false)
-
-      if (failureCount > 0) {
-        setMapError(`Could not map ${failureCount} place(s).`)
-      } else {
-        setMapError('')
-      }
-    }
-
-    loadMapPlaces().catch((loadError) => {
-      if (isMounted) {
-        setMapLoading(false)
-        setMapError(loadError.message)
-      }
-    })
-
-    return () => {
-      isMounted = false
-    }
-  }, [selectedMapDayPlaces, itinerary?.destination, trip?.destination])
-
   const updateItinerary = (updater) => {
     setItinerary((previous) => {
       if (!previous) return previous
@@ -348,12 +233,6 @@ function Recommendations() {
       })
       return next
     })
-  }
-
-  const handleViewOnMap = (dayId, placeName) => {
-    setSelectedMapDayId(dayId || 'all')
-    setFocusedMapPlaceName(String(placeName || '').trim())
-    mapSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 
   const handleNavigate = (placeName) => {
@@ -926,22 +805,17 @@ function Recommendations() {
                               {place.description || 'No description available.'}
                             </p>
                           </div>
-                          <div className="mt-3 flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              onClick={() => handleViewOnMap(day.id, place.name)}
-                              className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"
-                            >
-                              View on Map
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleNavigate(place.name)}
-                              className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"
-                            >
-                              Navigate
-                            </button>
-                          </div>
+                          {isNavigableLocation(place) && (
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleNavigate(place.name)}
+                                className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                              >
+                                Navigate
+                              </button>
+                            </div>
+                          )}
                         </article>
                       ))}
                     </div>
@@ -1145,40 +1019,6 @@ function Recommendations() {
             )}
           </section>
         ))}
-
-        <section
-          ref={mapSectionRef}
-          className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm"
-        >
-          <h3 className="text-lg font-semibold text-slate-900">Map & Route</h3>
-          <p className="mt-1 text-sm text-slate-600">
-            View day-wise route and navigate places directly with Google Maps.
-          </p>
-
-          <div className="mt-3 flex flex-wrap gap-2">
-            {mapDayOptions.map((dayOption) => (
-              <button
-                key={dayOption.id}
-                type="button"
-                onClick={() => setSelectedMapDayId(dayOption.id)}
-                className={`rounded-md px-3 py-1.5 text-sm font-medium ${
-                  selectedMapDayId === dayOption.id
-                    ? 'bg-slate-900 text-white'
-                    : 'border border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
-                }`}
-              >
-                {dayOption.label}
-              </button>
-            ))}
-          </div>
-
-          {mapLoading && <p className="mt-3 text-sm text-slate-600">Loading coordinates...</p>}
-          {mapError && <p className="mt-3 text-sm text-amber-700">{mapError}</p>}
-
-          <div className="mt-4">
-            <MapView places={mapPlaces} focusedPlaceName={focusedMapPlaceName} />
-          </div>
-        </section>
       </div>
     </PageContainer>
   )

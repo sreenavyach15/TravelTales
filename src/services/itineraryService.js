@@ -20,8 +20,48 @@ function addDays(dateString, offset) {
   return base.toISOString().split('T')[0]
 }
 
+const MAJOR_ROUNDING_STEP = 100
+const LARGE_MAJOR_ROUNDING_STEP = 500
+const FARE_ROUNDING_STEP = 100
+
+function roundToStep(value, step = MAJOR_ROUNDING_STEP) {
+  const numeric = Number(value || 0)
+  const safeStep = Math.max(1, Number(step || 1))
+  if (!Number.isFinite(numeric)) {
+    return 0
+  }
+  return Math.max(0, Math.round(numeric / safeStep) * safeStep)
+}
+
+function roundMajorAmount(value) {
+  const amount = Math.abs(Number(value || 0))
+  const step = amount >= 100000 ? LARGE_MAJOR_ROUNDING_STEP : MAJOR_ROUNDING_STEP
+  return roundToStep(value, step)
+}
+
+function roundFareAmount(value) {
+  const amount = Math.abs(Number(value || 0))
+  const step = amount <= 300 ? 50 : FARE_ROUNDING_STEP
+  return roundToStep(value, step)
+}
+
+function floorToStep(value, step = MAJOR_ROUNDING_STEP) {
+  const numeric = Number(value || 0)
+  const safeStep = Math.max(1, Number(step || 1))
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 0
+  }
+  return Math.floor(numeric / safeStep) * safeStep
+}
+
+function roundBudgetCap(value) {
+  const amount = Math.abs(Number(value || 0))
+  const step = amount >= 100000 ? LARGE_MAJOR_ROUNDING_STEP : MAJOR_ROUNDING_STEP
+  return floorToStep(value, step)
+}
+
 function roundBudget(value) {
-  return Math.max(0, Math.round(Number(value || 0)))
+  return roundMajorAmount(value)
 }
 
 function parseTimeToHour(timeValue) {
@@ -67,16 +107,18 @@ function parseEstimatedTimeRange(value) {
   return { startHour, endHour }
 }
 
-function distributeEvenly(total, count) {
+function distributeEvenly(total, count, step = MAJOR_ROUNDING_STEP) {
   const safeCount = Math.max(1, Number(count || 1))
-  const safeTotal = roundBudget(total)
-  const baseValue = Math.floor(safeTotal / safeCount)
-  let remainder = safeTotal - baseValue * safeCount
+  const safeStep = Math.max(1, Number(step || 1))
+  const safeTotal = roundToStep(total, safeStep)
+  const totalUnits = Math.round(safeTotal / safeStep)
+  const baseUnits = Math.floor(totalUnits / safeCount)
+  let remainderUnits = totalUnits - baseUnits * safeCount
 
   return Array.from({ length: safeCount }).map(() => {
-    const bump = remainder > 0 ? 1 : 0
-    remainder -= bump
-    return baseValue + bump
+    const bump = remainderUnits > 0 ? 1 : 0
+    remainderUnits -= bump
+    return (baseUnits + bump) * safeStep
   })
 }
 
@@ -299,7 +341,7 @@ function buildActivity({
       stopNumber === 1
         ? transportPlan?.firstLegLabel || 'Hotel -> Place (Cab)'
         : resolvedTravelMode,
-    travelFare: roundBudget(itemBudget * 0.12 * fareMultiplier),
+    travelFare: roundFareAmount(itemBudget * 0.12 * fareMultiplier),
     activities: selected.activities,
     thingsToTry: selected.try,
     estimatedBudget: itemBudget,
@@ -329,7 +371,7 @@ function buildComplementaryActivity({
     date,
     estimatedTime: `${formatHour(startHour)} - ${formatHour(endHour)}`,
     travelModeFromPrevious: resolvedTravelMode,
-    travelFare: roundBudget(
+    travelFare: roundFareAmount(
       Math.max(itemBudget * 0.18, complementaryPlace.travelFareBase || 0) * fareMultiplier,
     ),
     activities:
@@ -344,30 +386,116 @@ function buildComplementaryActivity({
   }
 }
 
-function normalizePlace(place, fallbackDate = '') {
+function isAccommodationStop(text) {
+  return /\b(hotel|resort|hostel|accommodation|stay|check[\s-]?in)\b/i.test(String(text || ''))
+}
+
+function sanitizeLocationHint(value) {
+  return String(value || '')
+    .replace(/\bcheck[\s-]?in(?:\s+into)?\s+hotel\s+(?:at|in)\b/gi, ' ')
+    .replace(/\b(hotel|resort|hostel|accommodation|stay|check[\s-]?in|check[\s-]?out|into|the)\b/gi, ' ')
+    .replace(/\b(breakfast|lunch|dinner|brunch|snack|meal|freshen|rest|relax|activity|activities|sightseeing)\b/gi, ' ')
+    .replace(/\b(arrival|departure|transit|transfer|travel|journey)\b/gi, ' ')
+    .replace(/\b(?:at|in)\b(?=\s+(?:at|in)\b)/gi, ' ')
+    .replace(/\b(and|then)\b/gi, ' ')
+    .replace(/&/g, ' ')
+    .replace(/^(?:(?:at|in)\s+)+/i, '')
+    .replace(/\s+(?:and|then|&)\s*$/i, '')
+    .replace(/[^\w\s&'-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function isLikelyLocation(value) {
+  const text = String(value || '').trim()
+  if (!text) return false
+  if (text.split(/\s+/).length > 8) return false
+  if (/^(and|then)$/i.test(text)) return false
+  if (/^(arrival|departure|transit|transfer|travel|journey)$/i.test(text)) return false
+  if (/\b(and|then|before|after|arrival|departure|transit|transfer|travel|journey|&)\s*$/i.test(text)) return false
+  return true
+}
+
+function extractAccommodationLocation(text, fallbackDestination = 'destination') {
+  const raw = String(text || '').trim()
+  const stripped = raw
+    .replace(/\bcheck[\s-]?in(?:\s+into)?\s+hotel\b/gi, ' ')
+    .replace(/\bcheck[\s-]?in\b/gi, ' ')
+    .replace(/\bhotel\b/gi, ' ')
+    .trim()
+  const atMatch = stripped.match(/\b(?:at|in)\s+([A-Za-z][A-Za-z0-9\s&'/-]{1,70})/i)
+  const candidates = [atMatch?.[1], stripped]
+
+  for (const candidate of candidates) {
+    const cleaned = sanitizeLocationHint(candidate)
+    if (isLikelyLocation(cleaned)) {
+      return cleaned
+    }
+  }
+
+  const fallback = sanitizeLocationHint(fallbackDestination)
+  return fallback || 'destination'
+}
+
+function normalizeAccommodationStopName(name, fallbackDestination = 'destination') {
+  const rawName = String(name || '').trim()
+  if (!rawName) {
+    return rawName
+  }
+
+  if (!isAccommodationStop(rawName)) {
+    return rawName
+  }
+
+  const location = extractAccommodationLocation(rawName, fallbackDestination)
+  return `Check-In into hotel at ${location}`
+}
+
+function normalizeAccommodationActivities(activities, placeName, fallbackDestination = 'destination') {
+  const text = String(activities || '').trim()
+  if (!text || isAccommodationStop(placeName) || isAccommodationStop(text)) {
+    const location = extractAccommodationLocation(placeName || text, fallbackDestination)
+    return `Check-In into hotel at ${location}. Freshen up and rest before the next activity.`
+  }
+
+  return text
+}
+
+function normalizePlace(place, fallbackDate = '', fallbackDestination = 'destination') {
+  const rawName = String(place?.name || place?.place || '').trim()
+  const normalizedName = normalizeAccommodationStopName(rawName, fallbackDestination)
+  const isAccommodation = isAccommodationStop(rawName) || isAccommodationStop(normalizedName)
+
   return {
     id: place?.id || generateId('place'),
-    name: String(place?.name || place?.place || '').trim(),
+    name: normalizedName,
     date: String(place?.date || fallbackDate || '').trim(),
     estimatedTime: String(place?.estimatedTime || '').trim(),
     travelModeFromPrevious: String(place?.travelModeFromPrevious || '').trim(),
     travelFare: roundBudget(place?.travelFare),
-    activities: String(place?.activities || place?.thingsToDo || '').trim(),
-    thingsToTry: String(place?.thingsToTry || '').trim(),
+    activities: normalizeAccommodationActivities(
+      place?.activities || place?.thingsToDo,
+      normalizedName,
+      fallbackDestination,
+    ),
+    thingsToTry: isAccommodation ? '' : String(place?.thingsToTry || '').trim(),
     estimatedBudget: roundBudget(place?.estimatedBudget),
-    description: String(place?.description || '').trim(),
+    description: isAccommodation
+      ? `Accommodation stop near ${extractAccommodationLocation(normalizedName, fallbackDestination)}.`
+      : String(place?.description || '').trim(),
   }
 }
 
 function summarizeDay(day, accommodationCost) {
-  const placesBudget = day.places.reduce((sum, place) => sum + place.estimatedBudget, 0)
-  const travelFare = day.places.reduce((sum, place) => sum + place.travelFare, 0)
+  const placesBudget = roundMajorAmount(day.places.reduce((sum, place) => sum + place.estimatedBudget, 0))
+  const travelFare = roundFareAmount(day.places.reduce((sum, place) => sum + place.travelFare, 0))
+  const safeAccommodationCost = roundMajorAmount(accommodationCost)
   return {
     ...day,
-    accommodationCost,
+    accommodationCost: safeAccommodationCost,
     placesBudget,
     travelFare,
-    totalDayBudget: placesBudget + travelFare + accommodationCost,
+    totalDayBudget: roundMajorAmount(placesBudget + travelFare + safeAccommodationCost),
   }
 }
 
@@ -411,21 +539,20 @@ function getTransportPlan(trip) {
   const transportOwnership = String(getTripPreference(trip, 'transportOwnership', 'public'))
     .trim()
     .toLowerCase()
-  const passengerCount = Math.max(1, Number(trip?.passengerCount || 1))
 
   if (transportOwnership === 'own') {
     return {
-      modeLabel: 'Cab / Walk',
-      firstLegLabel: 'Hotel -> Place (Cab)',
-      fareMultiplier: Math.max(0.7, Math.min(1.2, 0.8 + passengerCount * 0.08)),
+      modeLabel: 'Private Vehicle / Walk',
+      firstLegLabel: 'Hotel -> Place (Private Vehicle)',
+      fareMultiplier: 1,
       forceMode: true,
     }
   }
 
   return {
-    modeLabel: 'Public Transit + Walk',
+    modeLabel: 'Public Transit / Walk',
     firstLegLabel: 'Hotel -> Place (Bus / Metro)',
-    fareMultiplier: Math.max(1, Math.min(3, 0.8 + passengerCount * 0.35)),
+    fareMultiplier: 1,
     forceMode: false,
   }
 }
@@ -456,6 +583,38 @@ function inferPublicTransportMode(travelFare) {
   return 'Cab'
 }
 
+function estimateDailyDistanceKm(places) {
+  const safePlaces = Array.isArray(places) ? places : []
+  const placeCount = Math.max(1, safePlaces.length)
+  const transitHours = safePlaces.reduce((sum, place) => sum + estimateTransitHours(place), 0)
+  const destinationBoost = safePlaces.some((place) =>
+    /\b(valley|falls|fort|museum|beach|temple|lake|cave|island|hill|coast|market)\b/i.test(
+      String(place?.name || ''),
+    ),
+  )
+    ? 8
+    : 0
+
+  return Math.max(8, Math.round(placeCount * 11 + transitHours * 9 + destinationBoost))
+}
+
+function estimateOwnTransportDailyFare(places, passengerCount) {
+  const distanceKm = estimateDailyDistanceKm(places)
+  const placeCount = Math.max(1, Array.isArray(places) ? places.length : 1)
+  const driverCharge = 1100 + Math.max(0, passengerCount - 2) * 120
+  const fuelAndVehicleUsage = distanceKm * 12
+  const parkingAndToll = placeCount >= 4 ? 350 : 200
+  return roundFareAmount(driverCharge + fuelAndVehicleUsage + parkingAndToll)
+}
+
+function estimatePublicTransportDailyFare(places, passengerCount) {
+  const distanceKm = estimateDailyDistanceKm(places)
+  const placeCount = Math.max(1, Array.isArray(places) ? places.length : 1)
+  const perPersonTransit = distanceKm * 4.5
+  const localTransfers = 180 + placeCount * 90
+  return roundFareAmount(perPersonTransit * passengerCount + localTransfers)
+}
+
 export function applyTransportAccessRules(itinerary, trip) {
   if (!itinerary?.days?.length) {
     return itinerary
@@ -464,31 +623,41 @@ export function applyTransportAccessRules(itinerary, trip) {
   const ownership = String(getTripPreference(trip, 'transportOwnership', 'public'))
     .trim()
     .toLowerCase()
+  const passengerCount = Math.max(1, Number(trip?.passengerCount || 1))
 
   const normalizedDays = itinerary.days.map((day) => {
     const places = Array.isArray(day?.places) ? day.places : []
+    if (places.length === 0) {
+      return day
+    }
+
+    const dailyFareEstimate =
+      ownership === 'own'
+        ? estimateOwnTransportDailyFare(places, passengerCount)
+        : estimatePublicTransportDailyFare(places, passengerCount)
+    const dailyFareByPlace =
+      ownership === 'own'
+        ? places.map((_, index) => (index === 0 ? dailyFareEstimate : 0))
+        : distributeEvenly(dailyFareEstimate, places.length, FARE_ROUNDING_STEP)
+
     const normalizedPlaces = places.map((place, index) => {
       const currentMode = normalizeTransportModeLabel(place?.travelModeFromPrevious)
+      const plannedFare = roundFareAmount(dailyFareByPlace[index] || 0)
 
       if (ownership === 'own') {
-        const mode =
-          currentMode === 'Walk' || currentMode === 'Cab'
-            ? currentMode
-            : Number(place?.travelFare || 0) <= 100
-              ? 'Walk'
-              : 'Cab'
+        const mode = index === 0 ? 'Private Vehicle' : currentMode === 'Walk' ? 'Walk' : 'Private Vehicle / Walk'
         return {
           ...place,
           travelModeFromPrevious: index === 0 ? `Hotel -> Place (${mode})` : mode,
-          travelFare: mode === 'Walk' ? 0 : roundBudget(place?.travelFare || 150),
+          travelFare: index === 0 ? plannedFare : 0,
         }
       }
 
-      const mode = currentMode || inferPublicTransportMode(place?.travelFare)
+      const mode = currentMode || inferPublicTransportMode(plannedFare)
       return {
         ...place,
         travelModeFromPrevious: index === 0 ? `Hotel -> Place (${mode})` : mode,
-        travelFare: mode === 'Walk' ? 0 : roundBudget(place?.travelFare || 120),
+        travelFare: mode === 'Walk' ? 0 : plannedFare,
       }
     })
 
@@ -668,7 +837,7 @@ function enforceDailyFeasibility(day, trip, dayIndex, totalDays, constraints, in
 
   const uniqueByName = new Map()
   placesRaw.forEach((place) => {
-    const normalized = normalizePlace(place, date)
+    const normalized = normalizePlace(place, date, trip?.destination || '')
     const key = normalizeText(normalized.name) || normalized.id
     if (!uniqueByName.has(key)) {
       uniqueByName.set(key, normalized)
@@ -719,7 +888,7 @@ function applyBudgetDistributionWithBuffer(itinerary, trip) {
 
   const travelStyle = getTripTravelStyle(trip)
   const dayCount = itinerary.days.length
-  const budgetLimit = roundBudget(itinerary?.budgetLimit || trip?.budget || 0)
+  const budgetLimit = roundBudgetCap(itinerary?.budgetLimit || trip?.budget || 0)
   const effectiveBudget = roundBudget(budgetLimit * 0.92)
 
   const accommodationRatio =
@@ -769,7 +938,10 @@ export function optimizeItineraryForTrip(itinerary, trip) {
     return itinerary
   }
 
-  return applyTransportAccessRules(recalculateItinerary(itinerary, trip), trip)
+  return enforceBudgetCeiling(
+    applyTransportAccessRules(recalculateItinerary(itinerary, trip), trip),
+    trip,
+  )
 }
 
 function normalizeText(text) {
@@ -901,7 +1073,9 @@ export function recalculateItinerary(itinerary, trip = null) {
   const normalizedDaysBase = itinerary.days.map((day, index) => {
     const normalizedDayDate = String(day?.date || '').trim()
     const places = Array.isArray(day?.places) ? day.places : []
-    const normalizedPlaces = places.map((place) => normalizePlace(place, normalizedDayDate))
+    const normalizedPlaces = places.map((place) =>
+      normalizePlace(place, normalizedDayDate, itinerary?.destination || trip?.destination || ''),
+    )
 
     return {
       id: day?.id || generateId('day'),
@@ -909,36 +1083,113 @@ export function recalculateItinerary(itinerary, trip = null) {
       date: normalizedDayDate,
       places: normalizedPlaces,
       accommodationCost: roundBudget(day?.accommodationCost),
+      hasAccommodationInput: day?.accommodationCost !== undefined && day?.accommodationCost !== null,
     }
   })
 
   const dayCount = Math.max(1, normalizedDaysBase.length)
-  const budgetLimit = roundBudget(itinerary?.budgetLimit || trip?.budget || 0)
+  const budgetLimit = roundBudgetCap(itinerary?.budgetLimit || trip?.budget || 0)
 
-  const hasAnyAccommodation = normalizedDaysBase.some((day) => day.accommodationCost > 0)
+  const hasAnyAccommodation = normalizedDaysBase.some((day) => day.hasAccommodationInput)
   const distributedAccommodation = hasAnyAccommodation
     ? normalizedDaysBase.map((day) => day.accommodationCost)
     : distributeEvenly(roundBudget(budgetLimit * 0.35), dayCount)
 
-  const normalizedDays = normalizedDaysBase.map((day, index) =>
-    summarizeDay(day, distributedAccommodation[index] ?? 0),
-  )
+  const normalizedDays = normalizedDaysBase.map((day, index) => {
+    const { hasAccommodationInput: _hasAccommodationInput, ...dayWithoutFlag } = day
+    return summarizeDay(dayWithoutFlag, distributedAccommodation[index] ?? 0)
+  })
 
   const totalEstimatedBudget = normalizedDays.reduce((sum, day) => sum + day.placesBudget, 0)
   const totalTravelFare = normalizedDays.reduce((sum, day) => sum + day.travelFare, 0)
   const totalAccommodation = normalizedDays.reduce((sum, day) => sum + day.accommodationCost, 0)
-  const plannedBudget = totalEstimatedBudget + totalTravelFare + totalAccommodation
+  const plannedBudget = roundMajorAmount(totalEstimatedBudget + totalTravelFare + totalAccommodation)
 
   return {
     ...itinerary,
     budgetLimit,
     days: normalizedDays,
-    totalEstimatedBudget,
-    totalTravelFare,
-    totalAccommodation,
+    totalEstimatedBudget: roundMajorAmount(totalEstimatedBudget),
+    totalTravelFare: roundFareAmount(totalTravelFare),
+    totalAccommodation: roundMajorAmount(totalAccommodation),
     plannedBudget,
     whyThisPlan: normalizeWhyThisPlan(itinerary?.whyThisPlan, trip, dayCount),
   }
+}
+
+export function enforceBudgetCeiling(itinerary, trip = null) {
+  const normalized = recalculateItinerary(itinerary, trip)
+  if (!normalized?.days?.length) {
+    return normalized
+  }
+
+  const budgetLimit = roundBudgetCap(normalized?.budgetLimit || trip?.budget || 0)
+  if (budgetLimit <= 0 || normalized.plannedBudget <= budgetLimit) {
+    return normalized
+  }
+
+  let overflow = roundBudget(normalized.plannedBudget - budgetLimit)
+  const days = normalized.days.map((day) => ({
+    ...day,
+    places: (day.places || []).map((place) => ({ ...place })),
+  }))
+
+  function reduceField(field, floor) {
+    const refs = []
+    days.forEach((day) => {
+      day.places.forEach((place) => {
+        if (Number(place?.[field] || 0) > floor) {
+          refs.push(place)
+        }
+      })
+    })
+
+    refs.sort((a, b) => Number(b?.[field] || 0) - Number(a?.[field] || 0))
+    refs.forEach((place) => {
+      if (overflow <= 0) {
+        return
+      }
+      const current = Number(place?.[field] || 0)
+      const reducible = Math.max(0, current - floor)
+      if (reducible <= 0) {
+        return
+      }
+
+      const cut = Math.min(reducible, overflow)
+      place[field] = roundBudget(current - cut)
+      overflow -= cut
+    })
+  }
+
+  reduceField('travelFare', 0)
+  reduceField('estimatedBudget', 120)
+  if (overflow > 0) {
+    reduceField('estimatedBudget', 0)
+  }
+
+  if (overflow > 0) {
+    const dayRefs = [...days].sort((a, b) => Number(b.accommodationCost || 0) - Number(a.accommodationCost || 0))
+    dayRefs.forEach((day) => {
+      if (overflow <= 0) {
+        return
+      }
+      const current = Number(day.accommodationCost || 0)
+      if (current <= 0) {
+        return
+      }
+      const cut = Math.min(current, overflow)
+      day.accommodationCost = roundBudget(current - cut)
+      overflow -= cut
+    })
+  }
+
+  return recalculateItinerary(
+    {
+      ...normalized,
+      days,
+    },
+    trip,
+  )
 }
 
 export function balanceItineraryBudget(itinerary, trip = null) {
@@ -949,7 +1200,12 @@ export function balanceItineraryBudget(itinerary, trip = null) {
 
   const dayCount = normalized.days.length
   const totalAccommodation = normalized.totalAccommodation || 0
-  const targetVariableTotal = Math.max(0, normalized.budgetLimit - totalAccommodation)
+  const targetBudgetCap = roundBudget(normalized.budgetLimit * 0.85)
+  const targetPlannedBudget = Math.min(
+    normalized.budgetLimit,
+    Math.max(totalAccommodation, targetBudgetCap),
+  )
+  const targetVariableTotal = Math.max(0, targetPlannedBudget - totalAccommodation)
   const targetPerDay = targetVariableTotal / dayCount
 
   const adjustedDays = normalized.days.map((day) => {
@@ -971,7 +1227,7 @@ export function balanceItineraryBudget(itinerary, trip = null) {
     }
   })
 
-  return recalculateItinerary(
+  return enforceBudgetCeiling(
     {
       ...normalized,
       days: adjustedDays,
@@ -1053,7 +1309,7 @@ export function injectComplementaryDestinations(itinerary, trip) {
 export function generateItineraryFromTrip(trip) {
   const destination = trip.destination || 'Destination'
   const dayCount = getTripDayCount(trip.startDate, trip.endDate)
-  const tripBudget = roundBudget(trip.budget)
+  const tripBudget = roundBudgetCap(trip.budget)
   const passengerCount = Math.max(1, Number(trip?.passengerCount || 1))
   const budgetPerHead = roundBudget(
     Number(trip?.budgetPerHead || tripBudget / Math.max(1, passengerCount)),

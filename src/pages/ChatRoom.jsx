@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import PageContainer from '../components/PageContainer'
 import { useAuth } from '../hooks/useAuth'
@@ -10,11 +10,12 @@ import {
   listPendingChatInvitesForUser,
   listUserChatRooms,
   markChatRoomAsRead,
+  CHAT_FILE_SIZE_LIMIT_MB,
   sendMessageToChatRoom,
   subscribeToChatRoomMessages,
 } from '../services/chatService'
 import { getTripById } from '../services/tripService'
-import { normalizeEmail, resolveDisplayName } from '../services/userService'
+import { getUserProfileByUid, normalizeEmail, resolveDisplayName } from '../services/userService'
 
 function getInviteMessage(prefix, result) {
   const parts = [`${prefix}: ${result.invitedUsers.length} invite(s) sent.`]
@@ -29,6 +30,64 @@ function getInviteMessage(prefix, result) {
   return parts.join(' ')
 }
 
+const URL_PATTERN = /(https?:\/\/[^\s]+|www\.[^\s]+)/gi
+
+function normalizeHyperlink(urlCandidate) {
+  const url = String(urlCandidate || '').trim()
+  if (!url) return ''
+  return /^https?:\/\//i.test(url) ? url : `https://${url}`
+}
+
+function renderTextWithLinks(text, isSelf) {
+  const rawText = String(text || '')
+  if (!rawText) {
+    return null
+  }
+
+  const chunks = []
+  let lastIndex = 0
+
+  for (const match of rawText.matchAll(URL_PATTERN)) {
+    const matchText = match[0]
+    const matchIndex = match.index ?? 0
+
+    if (matchIndex > lastIndex) {
+      chunks.push(rawText.slice(lastIndex, matchIndex))
+    }
+
+    const href = normalizeHyperlink(matchText)
+    chunks.push(
+      <a
+        key={`${matchIndex}_${matchText}`}
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className={`underline underline-offset-2 ${isSelf ? 'text-cyan-100' : 'text-sky-700'}`}
+      >
+        {matchText}
+      </a>,
+    )
+    lastIndex = matchIndex + matchText.length
+  }
+
+  if (lastIndex < rawText.length) {
+    chunks.push(rawText.slice(lastIndex))
+  }
+
+  return chunks
+}
+
+function formatFileSize(bytes) {
+  const size = Number(bytes || 0)
+  if (size >= 1024 * 1024) {
+    return `${(size / (1024 * 1024)).toFixed(2)} MB`
+  }
+  if (size >= 1024) {
+    return `${(size / 1024).toFixed(1)} KB`
+  }
+  return `${size} B`
+}
+
 function ChatRoom() {
   const { user } = useAuth()
   const [searchParams] = useSearchParams()
@@ -40,11 +99,17 @@ function ChatRoom() {
   const [pendingInvites, setPendingInvites] = useState([])
   const [activeRoomId, setActiveRoomId] = useState('')
   const [messages, setMessages] = useState([])
+  const [showMembers, setShowMembers] = useState(false)
+  const [showInvitePanel, setShowInvitePanel] = useState(false)
+  const [roomMembers, setRoomMembers] = useState([])
+  const [membersLoading, setMembersLoading] = useState(false)
 
   const [groupName, setGroupName] = useState('')
   const [initialInviteEmails, setInitialInviteEmails] = useState('')
   const [memberInviteEmails, setMemberInviteEmails] = useState('')
   const [newMessage, setNewMessage] = useState('')
+  const [selectedFile, setSelectedFile] = useState(null)
+  const [senderDisplayName, setSenderDisplayName] = useState('')
 
   const [loading, setLoading] = useState(true)
   const [status, setStatus] = useState('')
@@ -53,6 +118,8 @@ function ChatRoom() {
   const [isInvitingMembers, setIsInvitingMembers] = useState(false)
   const [joiningInviteId, setJoiningInviteId] = useState('')
   const [isSending, setIsSending] = useState(false)
+  const fileInputRef = useRef(null)
+  const messagesEndRef = useRef(null)
 
   const activeRoom = useMemo(
     () => rooms.find((room) => room.id === activeRoomId) || null,
@@ -89,7 +156,7 @@ function ChatRoom() {
       if (!fetchedTrip) {
         throw new Error('Trip not found.')
       }
-      fetchedTripRoom = await getChatRoomByTripId(tripId)
+      fetchedTripRoom = await getChatRoomByTripId(tripId, user.uid)
     }
 
     setRooms(joinedRooms)
@@ -158,6 +225,135 @@ function ChatRoom() {
       // Non-blocking best effort; unread indicator can self-heal on next open.
     })
   }, [activeRoomId, messages.length, user?.uid])
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [messages.length, activeRoomId])
+
+  useEffect(() => {
+    let isMounted = true
+    const fallbackName = resolveDisplayName({
+      displayName: user?.displayName,
+      email: user?.email,
+    })
+
+    if (!user?.uid) {
+      setSenderDisplayName('')
+      return () => {
+        isMounted = false
+      }
+    }
+
+    setSenderDisplayName(fallbackName)
+
+    getUserProfileByUid(user.uid)
+      .then((profile) => {
+        if (!isMounted) {
+          return
+        }
+        setSenderDisplayName(
+          resolveDisplayName({
+            displayName: profile?.displayName || user?.displayName,
+            email: user?.email,
+          }),
+        )
+      })
+      .catch(() => {
+        if (isMounted) {
+          setSenderDisplayName(fallbackName)
+        }
+      })
+
+    return () => {
+      isMounted = false
+    }
+  }, [user?.uid, user?.displayName, user?.email])
+
+  useEffect(() => {
+    setShowInvitePanel(false)
+    setMemberInviteEmails('')
+    setSelectedFile(null)
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+  }, [activeRoomId])
+
+  useEffect(() => {
+    let isMounted = true
+
+    async function loadRoomMembers() {
+      if (!showMembers || !activeRoom) {
+        if (isMounted) {
+          setRoomMembers([])
+          setMembersLoading(false)
+        }
+        return
+      }
+
+      const memberUids = [...new Set(activeRoom.memberUids || [])]
+      const memberEmails = Array.isArray(activeRoom.memberEmails) ? activeRoom.memberEmails : []
+      const adminUid = String(activeRoom.adminUid || '').trim()
+      const adminEmail = normalizeEmail(activeRoom.adminEmail)
+
+      setMembersLoading(true)
+      try {
+        const profiles = await Promise.all(memberUids.map((uid) => getUserProfileByUid(uid)))
+        if (!isMounted) {
+          return
+        }
+
+        const profileByUid = Object.fromEntries(
+          profiles
+            .filter((profile) => profile?.uid)
+            .map((profile) => [profile.uid, profile]),
+        )
+
+        const members = memberUids.map((uid, index) => {
+          const profile = profileByUid[uid]
+          const email = profile?.email || memberEmails[index] || ''
+          return {
+            uid,
+            email,
+            name: resolveDisplayName({
+              displayName: profile?.displayName,
+              email,
+            }),
+            isAdmin: (uid && uid === adminUid) || (!!email && normalizeEmail(email) === adminEmail),
+          }
+        })
+
+        const coveredEmails = new Set(members.map((member) => normalizeEmail(member.email)))
+        memberEmails
+          .map((email) => normalizeEmail(email))
+          .filter(Boolean)
+          .forEach((email) => {
+            if (!coveredEmails.has(email)) {
+              members.push({
+                uid: '',
+                email,
+                name: resolveDisplayName({ displayName: '', email }),
+                isAdmin: normalizeEmail(email) === adminEmail,
+              })
+            }
+          })
+
+        setRoomMembers(members)
+      } catch (loadMembersError) {
+        if (isMounted) {
+          setError(loadMembersError.message)
+        }
+      } finally {
+        if (isMounted) {
+          setMembersLoading(false)
+        }
+      }
+    }
+
+    loadRoomMembers()
+    return () => {
+      isMounted = false
+    }
+  }, [activeRoom, showMembers])
 
   const handleCreateRoom = async (event) => {
     event.preventDefault()
@@ -245,12 +441,43 @@ function ChatRoom() {
         roomId: activeRoomId,
         user,
         text: newMessage,
+        file: selectedFile,
+        authorName: senderDisplayName,
       })
       setNewMessage('')
+      setSelectedFile(null)
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
     } catch (sendError) {
       setError(sendError.message)
     } finally {
       setIsSending(false)
+    }
+  }
+
+  const handleAttachmentPick = (event) => {
+    const file = event.target.files?.[0] || null
+    if (!file) {
+      setSelectedFile(null)
+      return
+    }
+    if (file.size > CHAT_FILE_SIZE_LIMIT_MB * 1024 * 1024) {
+      setError(`File exceeds ${CHAT_FILE_SIZE_LIMIT_MB} MB limit.`)
+      setSelectedFile(null)
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
+      return
+    }
+    setError('')
+    setSelectedFile(file)
+  }
+
+  const clearAttachment = () => {
+    setSelectedFile(null)
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
     }
   }
 
@@ -372,20 +599,50 @@ function ChatRoom() {
                         {activeRoom.memberUids?.length || 1}
                       </p>
                     </div>
-                    {isActiveRoomAdmin && (
-                      <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-semibold text-emerald-700">
-                        Room Admin
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowMembers((current) => !current)}
+                        className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                      >
+                        {showMembers ? 'Hide Members' : 'View Members'}
+                      </button>
+                      {isActiveRoomAdmin && (
+                        <button
+                          type="button"
+                          onClick={() => setShowInvitePanel((current) => !current)}
+                          className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-slate-300 bg-white text-slate-700 hover:bg-slate-100"
+                          title="Invite Members"
+                          aria-label="Invite Members"
+                        >
+                          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M15 8a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+                            <path d="M4 20a6 6 0 0 1 12 0" />
+                            <path d="M19 8v6" />
+                            <path d="M16 11h6" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
                   </div>
 
-                  {isActiveRoomAdmin && (
+                  {isActiveRoomAdmin && showInvitePanel && (
                     <form
                       className="rounded-md border border-slate-200 bg-slate-50 p-3"
                       onSubmit={handleInviteMembers}
                     >
-                      <label className="text-sm font-medium text-slate-700">
-                        Invite More Members (Email IDs)
+                      <div className="flex items-center justify-between gap-3">
+                        <h4 className="text-sm font-semibold text-slate-800">Invite Members</h4>
+                        <button
+                          type="button"
+                          onClick={() => setShowInvitePanel(false)}
+                          className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100"
+                        >
+                          Close
+                        </button>
+                      </div>
+                      <label className="mt-2 block text-sm font-medium text-slate-700">
+                        Email IDs
                         <textarea
                           value={memberInviteEmails}
                           onChange={(event) => setMemberInviteEmails(event.target.value)}
@@ -404,47 +661,167 @@ function ChatRoom() {
                     </form>
                   )}
 
-                  <div className="max-h-[420px] space-y-2 overflow-y-auto rounded-lg border border-slate-200 bg-slate-50 p-4">
+                  {showMembers && (
+                    <section className="rounded-md border border-slate-200 bg-slate-50 p-3">
+                      <h4 className="text-sm font-semibold text-slate-800">Room Members</h4>
+                      {membersLoading ? (
+                        <p className="mt-2 text-sm text-slate-600">Loading members...</p>
+                      ) : roomMembers.length === 0 ? (
+                        <p className="mt-2 text-sm text-slate-600">No members found.</p>
+                      ) : (
+                        <ul className="mt-2 grid gap-2 sm:grid-cols-2">
+                          {roomMembers.map((member) => (
+                            <li
+                              key={member.uid || member.email}
+                              className={`rounded-md border px-3 py-2 ${
+                                member.isAdmin
+                                  ? 'border-emerald-300 bg-emerald-50'
+                                  : 'border-slate-200 bg-white'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <p className="text-sm font-semibold text-slate-800">{member.name}</p>
+                                {member.isAdmin && (
+                                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                                    Admin
+                                  </span>
+                                )}
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </section>
+                  )}
+
+                  <div className="max-h-[460px] overflow-y-auto rounded-lg border border-slate-200 bg-slate-50/60 p-3">
                     {messages.length === 0 ? (
-                      <p className="text-sm text-slate-600">No messages yet. Start the conversation.</p>
+                      <p className="px-2 py-6 text-center text-sm text-slate-600">
+                        No messages yet. Start the conversation.
+                      </p>
                     ) : (
-                      messages.map((message) => {
-                        const isSelf = normalizeEmail(message.authorEmail) === normalizeEmail(user?.email)
-                        const authorName = resolveDisplayName({
-                          displayName: message.authorName,
-                          email: message.authorEmail,
-                        })
-                        return (
-                          <div
-                            key={message.id}
-                            className={`rounded-md p-3 shadow-sm ${
-                              isSelf ? 'bg-slate-900 text-white' : 'bg-white text-slate-700'
-                            }`}
-                          >
-                            <p className={`text-xs font-semibold uppercase tracking-wide ${isSelf ? 'text-slate-200' : 'text-slate-500'}`}>
-                              {authorName}
-                            </p>
-                            <p className="mt-1 text-sm">{message.text}</p>
-                          </div>
-                        )
-                      })
+                      <div className="space-y-2.5">
+                        {messages.map((message) => {
+                          const isSystemMessage = String(message.messageType || '').toLowerCase() === 'system'
+                          const isSelf = normalizeEmail(message.authorEmail) === normalizeEmail(user?.email)
+                          const authorName = resolveDisplayName({
+                            displayName: message.authorName,
+                            email: message.authorEmail,
+                          })
+                          const fileUrl = String(message.fileUrl || message.attachment?.url || '').trim()
+                          const fileName = String(message.fileName || message.attachment?.name || 'Shared File').trim()
+                          const fileSize = Number(message.fileSize || message.attachment?.size || 0)
+
+                          if (isSystemMessage) {
+                            return (
+                              <div key={message.id} className="flex justify-center">
+                                <div className="max-w-[86%] rounded-full bg-slate-200 px-3 py-1.5 text-xs text-slate-700">
+                                  {message.text}
+                                </div>
+                              </div>
+                            )
+                          }
+
+                          return (
+                            <div
+                              key={message.id}
+                              className={`flex ${isSelf ? 'justify-end' : 'justify-start'}`}
+                            >
+                              <div className="max-w-[82%]">
+                                <p
+                                  className={`mb-1 px-1 text-[11px] font-semibold tracking-wide ${
+                                    isSelf
+                                      ? 'text-right text-slate-500'
+                                      : 'text-left text-slate-600'
+                                  }`}
+                                >
+                                  {authorName}
+                                </p>
+                                <div
+                                  className={`rounded-2xl px-3 py-2 text-sm leading-relaxed ${
+                                    isSelf
+                                      ? 'rounded-br-md bg-slate-900 text-white'
+                                      : 'rounded-bl-md bg-white text-slate-800'
+                                  }`}
+                                >
+                                  {message.text && (
+                                    <p className="whitespace-pre-wrap break-words">
+                                      {renderTextWithLinks(message.text, isSelf)}
+                                    </p>
+                                  )}
+                                  {fileUrl && (
+                                    <a
+                                      href={fileUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      download={fileName || true}
+                                      className={`mt-2 flex items-center justify-between gap-3 rounded-xl border px-3 py-2 text-sm ${
+                                        isSelf
+                                          ? 'border-slate-600 bg-slate-800 text-slate-100 hover:bg-slate-700'
+                                          : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
+                                      }`}
+                                    >
+                                      <span className="truncate">
+                                        {fileName || 'Shared File'} ({formatFileSize(fileSize)})
+                                      </span>
+                                      <span className="shrink-0 text-xs font-semibold uppercase tracking-wide">
+                                        Open
+                                      </span>
+                                    </a>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })}
+                        <div ref={messagesEndRef} />
+                      </div>
                     )}
                   </div>
 
-                  <form className="flex gap-2" onSubmit={handleSendMessage}>
-                    <input
-                      value={newMessage}
-                      onChange={(event) => setNewMessage(event.target.value)}
-                      placeholder="Type your message"
-                      className="flex-1 rounded-md border border-slate-300 px-3 py-2"
-                    />
-                    <button
-                      type="submit"
-                      disabled={isSending}
-                      className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
-                    >
-                      {isSending ? 'Sending...' : 'Send'}
-                    </button>
+                  <form className="space-y-2" onSubmit={handleSendMessage}>
+                    <div className="flex gap-2">
+                      <input
+                        value={newMessage}
+                        onChange={(event) => setNewMessage(event.target.value)}
+                        placeholder="Type your message or paste a link"
+                        className="flex-1 rounded-md border border-slate-300 px-3 py-2"
+                      />
+                      <button
+                        type="submit"
+                        disabled={isSending || (!newMessage.trim() && !selectedFile)}
+                        className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+                      >
+                        {isSending ? 'Sending...' : 'Send'}
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100">
+                        <span>Attach File</span>
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          className="hidden"
+                          onChange={handleAttachmentPick}
+                        />
+                      </label>
+                      <p className="text-xs text-slate-500">Max file size: {CHAT_FILE_SIZE_LIMIT_MB} MB</p>
+                      {selectedFile && (
+                        <div className="inline-flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-700">
+                          <span className="max-w-[220px] truncate">{selectedFile.name}</span>
+                          <span>({formatFileSize(selectedFile.size)})</span>
+                          <button
+                            type="button"
+                            onClick={clearAttachment}
+                            className="rounded px-1 text-slate-500 hover:bg-slate-200 hover:text-slate-700"
+                            aria-label="Remove attachment"
+                            title="Remove attachment"
+                          >
+                            x
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </form>
                 </>
               ) : (
