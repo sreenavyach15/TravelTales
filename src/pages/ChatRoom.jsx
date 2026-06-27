@@ -10,9 +10,13 @@ import {
   listPendingChatInvitesForUser,
   listUserChatRooms,
   markChatRoomAsRead,
+  hideChatRoomForUser,
+  leaveChatRoom,
+  removeChatRoomMember,
   CHAT_FILE_SIZE_LIMIT_MB,
   sendMessageToChatRoom,
   subscribeToChatRoomMessages,
+  subscribeToUserChatRooms,
 } from '../services/chatService'
 import { getTripById } from '../services/tripService'
 import { getUserProfileByUid, normalizeEmail, resolveDisplayName } from '../services/userService'
@@ -88,6 +92,18 @@ function formatFileSize(bytes) {
   return `${size} B`
 }
 
+function formatMessageTime(value) {
+  const date = value?.toDate?.() || null
+  if (!date) {
+    return ''
+  }
+
+  return date.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
 function ChatRoom() {
   const { user } = useAuth()
   const [searchParams] = useSearchParams()
@@ -117,6 +133,9 @@ function ChatRoom() {
   const [isCreatingRoom, setIsCreatingRoom] = useState(false)
   const [isInvitingMembers, setIsInvitingMembers] = useState(false)
   const [joiningInviteId, setJoiningInviteId] = useState('')
+  const [removingMemberUid, setRemovingMemberUid] = useState('')
+  const [isLeavingRoom, setIsLeavingRoom] = useState(false)
+  const [isHidingRoom, setIsHidingRoom] = useState(false)
   const [isSending, setIsSending] = useState(false)
   const fileInputRef = useRef(null)
   const messagesEndRef = useRef(null)
@@ -128,6 +147,10 @@ function ChatRoom() {
 
   const isTripOwner = trip?.userId === user?.uid
   const isActiveRoomAdmin = activeRoom?.adminUid === user?.uid
+  const isActiveRoomMember = Boolean(activeRoom?.memberUids?.includes(user?.uid))
+  const wasRemovedFromActiveRoom = Boolean(activeRoom?.removedMemberUids?.includes(user?.uid))
+  const leftActiveRoom = Boolean(activeRoom?.leftMemberUids?.includes(user?.uid))
+  const canUseActiveRoom = Boolean(activeRoom && isActiveRoomMember)
   const pendingInviteForTrip = pendingInvites.find((invite) => invite.roomId === tripRoom?.id) || null
 
   async function loadChatData(preferredRoomId = '') {
@@ -202,7 +225,29 @@ function ChatRoom() {
   }, [tripId, user?.uid])
 
   useEffect(() => {
-    if (!activeRoomId) {
+    if (!user?.uid) {
+      return undefined
+    }
+
+    return subscribeToUserChatRooms({
+      userId: user.uid,
+      onRooms: (syncedRooms) => {
+        setRooms(syncedRooms)
+        setActiveRoomId((currentRoomId) => {
+          if (syncedRooms.some((room) => room.id === currentRoomId)) {
+            return currentRoomId
+          }
+          return syncedRooms[0]?.id || ''
+        })
+      },
+      onError: (snapshotError) => {
+        setError(snapshotError.message)
+      },
+    })
+  }, [user?.uid])
+
+  useEffect(() => {
+    if (!activeRoomId || !canUseActiveRoom) {
       setMessages([])
       return undefined
     }
@@ -214,17 +259,17 @@ function ChatRoom() {
         setError(snapshotError.message)
       },
     })
-  }, [activeRoomId])
+  }, [activeRoomId, canUseActiveRoom])
 
   useEffect(() => {
-    if (!activeRoomId || !user?.uid) {
+    if (!activeRoomId || !user?.uid || !canUseActiveRoom) {
       return
     }
 
     markChatRoomAsRead({ roomId: activeRoomId, userId: user.uid }).catch(() => {
       // Non-blocking best effort; unread indicator can self-heal on next open.
     })
-  }, [activeRoomId, messages.length, user?.uid])
+  }, [activeRoomId, canUseActiveRoom, messages.length, user?.uid])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
@@ -408,6 +453,80 @@ function ChatRoom() {
     }
   }
 
+  const handleRemoveMember = async (member) => {
+    if (!activeRoom || !user?.uid) {
+      return
+    }
+
+    const confirmed = window.confirm(`Remove ${member.name || 'this member'} from this group?`)
+    if (!confirmed) {
+      return
+    }
+
+    setStatus('')
+    setError('')
+    setRemovingMemberUid(member.uid)
+    try {
+      await removeChatRoomMember({
+        roomId: activeRoom.id,
+        adminUser: user,
+        member,
+      })
+      await loadChatData(activeRoom.id)
+      setShowMembers(true)
+      setStatus(`${member.name || 'Member'} removed from the group.`)
+    } catch (removeError) {
+      setError(removeError.message)
+    } finally {
+      setRemovingMemberUid('')
+    }
+  }
+
+  const handleLeaveRoom = async () => {
+    if (!activeRoom || !user?.uid) {
+      return
+    }
+
+    const confirmed = window.confirm(`Leave "${activeRoom.roomName || 'this group'}"?`)
+    if (!confirmed) {
+      return
+    }
+
+    setStatus('')
+    setError('')
+    setIsLeavingRoom(true)
+    try {
+      await leaveChatRoom({ roomId: activeRoom.id, user })
+      await loadChatData(activeRoom.id)
+      setStatus('You left the group. You can remove it from your chat list now.')
+    } catch (leaveError) {
+      setError(leaveError.message)
+    } finally {
+      setIsLeavingRoom(false)
+    }
+  }
+
+  const handleHideRoom = async () => {
+    if (!activeRoom || !user?.uid) {
+      return
+    }
+
+    setStatus('')
+    setError('')
+    setIsHidingRoom(true)
+    try {
+      await hideChatRoomForUser({ roomId: activeRoom.id, userId: user.uid })
+      setRooms((previous) => previous.filter((room) => room.id !== activeRoom.id))
+      setActiveRoomId('')
+      setMessages([])
+      setStatus('Chat removed from your list.')
+    } catch (hideError) {
+      setError(hideError.message)
+    } finally {
+      setIsHidingRoom(false)
+    }
+  }
+
   const handleJoinInvite = async (invite) => {
     if (!user?.uid) {
       return
@@ -429,7 +548,7 @@ function ChatRoom() {
 
   const handleSendMessage = async (event) => {
     event.preventDefault()
-    if (!activeRoomId || !user?.uid) {
+    if (!activeRoomId || !user?.uid || !canUseActiveRoom) {
       return
     }
 
@@ -583,6 +702,12 @@ function ChatRoom() {
                   >
                     <p className="font-semibold">{room.roomName || 'Trip Group'}</p>
                     <p className="mt-1 text-xs opacity-80">{room.tripDestination || 'Destination not set'}</p>
+                    {room.removedMemberUids?.includes(user?.uid) && (
+                      <p className="mt-1 text-xs text-rose-600">Removed from group</p>
+                    )}
+                    {room.leftMemberUids?.includes(user?.uid) && (
+                      <p className="mt-1 text-xs text-amber-600">You left this group</p>
+                    )}
                   </button>
                 ))
               )}
@@ -623,8 +748,40 @@ function ChatRoom() {
                           </svg>
                         </button>
                       )}
+                      {isActiveRoomMember && (
+                        <button
+                          type="button"
+                          onClick={handleLeaveRoom}
+                          disabled={isLeavingRoom}
+                          className="rounded-md border border-rose-200 bg-rose-50 px-3 py-1.5 text-sm font-medium text-rose-700 hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-70"
+                        >
+                          {isLeavingRoom ? 'Leaving...' : 'Leave Group'}
+                        </button>
+                      )}
+                      {(wasRemovedFromActiveRoom || leftActiveRoom) && (
+                        <button
+                          type="button"
+                          onClick={handleHideRoom}
+                          disabled={isHidingRoom}
+                          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-70"
+                        >
+                          {isHidingRoom ? 'Removing...' : 'Remove From My List'}
+                        </button>
+                      )}
                     </div>
                   </div>
+
+                  {wasRemovedFromActiveRoom && (
+                    <div className="rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
+                      You have been removed from this group by admin.
+                    </div>
+                  )}
+
+                  {leftActiveRoom && (
+                    <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                      You left this group. You can remove it from your chat list.
+                    </div>
+                  )}
 
                   {isActiveRoomAdmin && showInvitePanel && (
                     <form
@@ -687,6 +844,16 @@ function ChatRoom() {
                                   </span>
                                 )}
                               </div>
+                              {isActiveRoomAdmin && member.uid && member.uid !== user?.uid && !member.isAdmin && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveMember(member)}
+                                  disabled={removingMemberUid === member.uid}
+                                  className="mt-2 rounded-md border border-rose-200 bg-white px-2.5 py-1 text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-70"
+                                >
+                                  {removingMemberUid === member.uid ? 'Removing...' : 'Remove Member'}
+                                </button>
+                              )}
                             </li>
                           ))}
                         </ul>
@@ -694,12 +861,13 @@ function ChatRoom() {
                     </section>
                   )}
 
-                  <div className="max-h-[460px] overflow-y-auto rounded-lg border border-slate-200 bg-slate-50/60 p-3">
-                    {messages.length === 0 ? (
+                  {canUseActiveRoom && (
+                    <div className="max-h-[460px] overflow-y-auto rounded-lg border border-slate-200 bg-slate-50/60 p-3">
+                      {messages.length === 0 ? (
                       <p className="px-2 py-6 text-center text-sm text-slate-600">
                         No messages yet. Start the conversation.
                       </p>
-                    ) : (
+                      ) : (
                       <div className="space-y-2.5">
                         {messages.map((message) => {
                           const isSystemMessage = String(message.messageType || '').toLowerCase() === 'system'
@@ -713,10 +881,14 @@ function ChatRoom() {
                           const fileSize = Number(message.fileSize || message.attachment?.size || 0)
 
                           if (isSystemMessage) {
+                            const systemMessageTime = formatMessageTime(message.createdAt || message.timestamp)
                             return (
                               <div key={message.id} className="flex justify-center">
                                 <div className="max-w-[86%] rounded-full bg-slate-200 px-3 py-1.5 text-xs text-slate-700">
                                   {message.text}
+                                  {systemMessageTime && (
+                                    <span className="ml-2 text-[11px] text-slate-500">{systemMessageTime}</span>
+                                  )}
                                 </div>
                               </div>
                             )
@@ -776,10 +948,12 @@ function ChatRoom() {
                         })}
                         <div ref={messagesEndRef} />
                       </div>
-                    )}
-                  </div>
+                      )}
+                    </div>
+                  )}
 
-                  <form className="space-y-2" onSubmit={handleSendMessage}>
+                  {canUseActiveRoom && (
+                    <form className="space-y-2" onSubmit={handleSendMessage}>
                     <div className="flex gap-2">
                       <input
                         value={newMessage}
@@ -822,7 +996,8 @@ function ChatRoom() {
                         </div>
                       )}
                     </div>
-                  </form>
+                    </form>
+                  )}
                 </>
               ) : (
                 <p className="text-sm text-slate-600">

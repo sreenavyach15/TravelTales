@@ -10,6 +10,7 @@ import {
   where,
 } from 'firebase/firestore'
 import { db } from '../firebase/config'
+import { getTripsByUser } from './tripService'
 
 function getDbInstance() {
   if (!db) {
@@ -152,4 +153,106 @@ export function subscribeToTripNotifications({ userId, onNotifications, onError 
       }
     },
   )
+}
+
+function getDateOnly(value) {
+  const date = new Date(value)
+  date.setHours(0, 0, 0, 0)
+  return date
+}
+
+function getTripStartDateTime(trip) {
+  if (!trip?.startDate) {
+    return null
+  }
+
+  const time = String(trip.arrivalTime || '00:00').trim() || '00:00'
+  const parsed = new Date(`${trip.startDate}T${time}`)
+  return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
+function getReminderMessage(trip, daysUntilStart, hoursUntilStart) {
+  const destination = String(trip?.destination || 'Your trip').trim()
+  if (daysUntilStart === 7) return `Your ${destination} trip starts in 7 days.`
+  if (daysUntilStart === 3) return `Your ${destination} trip starts in 3 days.`
+  if (daysUntilStart === 1) return `Your ${destination} trip starts tomorrow.`
+  if (daysUntilStart === 0 && hoursUntilStart > 0 && hoursUntilStart <= 3) {
+    return `Your ${destination} trip starts in ${hoursUntilStart} hour${hoursUntilStart === 1 ? '' : 's'}.`
+  }
+  return `Your ${destination} trip starts today.`
+}
+
+export async function ensureUpcomingTripReminderNotifications(userId) {
+  const normalizedUserId = normalizeUid(userId)
+  if (!normalizedUserId) {
+    return []
+  }
+
+  const [trips, notifications] = await Promise.all([
+    getTripsByUser(normalizedUserId),
+    listTripNotificationsForUser(normalizedUserId),
+  ])
+
+  const existingReminderKeys = new Set(
+    notifications
+      .map((notification) => notification?.metadata?.reminderKey)
+      .filter(Boolean),
+  )
+
+  const today = getDateOnly(new Date())
+  const now = new Date()
+  const remindersToCreate = []
+
+  trips.forEach((trip) => {
+    const tripStart = getTripStartDateTime(trip)
+    if (!tripStart) {
+      return
+    }
+
+    const startDay = getDateOnly(tripStart)
+    const daysUntilStart = Math.round((startDay.getTime() - today.getTime()) / (1000 * 60 * 60 * 24))
+    const hoursUntilStart = Math.ceil((tripStart.getTime() - now.getTime()) / (1000 * 60 * 60))
+    const shouldNotify =
+      [7, 3, 1].includes(daysUntilStart) ||
+      (daysUntilStart === 0 && hoursUntilStart >= 0)
+
+    if (!shouldNotify) {
+      return
+    }
+
+    const reminderKey =
+      daysUntilStart === 0 && hoursUntilStart > 0 && hoursUntilStart <= 3
+        ? `${trip.id}_starts_soon`
+        : `${trip.id}_starts_${daysUntilStart}_days`
+
+    if (existingReminderKeys.has(reminderKey)) {
+      return
+    }
+
+    remindersToCreate.push({
+      trip,
+      reminderKey,
+      daysUntilStart,
+      hoursUntilStart,
+    })
+  })
+
+  const created = []
+  for (const reminder of remindersToCreate) {
+    const result = await createTripNotifications({
+      tripId: reminder.trip.id,
+      message: getReminderMessage(reminder.trip, reminder.daysUntilStart, reminder.hoursUntilStart),
+      recipientUids: [normalizedUserId],
+      triggeredByUid: normalizedUserId,
+      type: 'trip_reminder',
+      metadata: {
+        reminderKey: reminder.reminderKey,
+        startDate: reminder.trip.startDate || '',
+        arrivalTime: reminder.trip.arrivalTime || '',
+      },
+    })
+    created.push(...result)
+  }
+
+  return created
 }

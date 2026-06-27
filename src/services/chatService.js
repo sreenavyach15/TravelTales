@@ -1,5 +1,6 @@
 import {
   addDoc,
+  arrayRemove,
   arrayUnion,
   collection,
   doc,
@@ -17,10 +18,13 @@ import {
 import { db } from '../firebase/config'
 import { validateEmail } from './authValidation'
 import { ensureSupabaseSession, supabase } from './supabaseClient'
+import { createTripNotifications } from './tripNotificationService'
 import {
   getDisplayNameFromEmail,
   getUserProfileByEmail,
+  getUserProfileByUid,
   normalizeEmail,
+  resolveDisplayName,
 } from './userService'
 
 function getDbInstance() {
@@ -122,6 +126,13 @@ function getTimestampMillis(value) {
   return value?.toMillis?.() ?? 0
 }
 
+function getAuthUserDisplayName(user) {
+  return resolveDisplayName({
+    displayName: user?.displayName,
+    email: user?.email,
+  })
+}
+
 async function resolveInviteTargets({ inviteEmails, currentUser, existingMemberEmails = [] }) {
   const normalizedInviteEmails = parseInviteEmails(inviteEmails)
   const existingMembers = new Set(existingMemberEmails.map((email) => normalizeEmail(email)))
@@ -214,6 +225,18 @@ async function upsertInvite({
   }
 
   await setDoc(inviteRef, payload, { merge: true })
+
+  await createTripNotifications({
+    tripId,
+    message: `You were invited to ${roomName || 'Trip Group'}.`,
+    recipientUids: [inviteeUid],
+    triggeredByUid: inviterUid,
+    type: 'chat_invite',
+    metadata: {
+      roomId,
+      inviteeEmail: normalizeEmail(inviteeEmail),
+    },
+  })
 }
 
 export async function createChatRoomForTrip({ trip, adminUser, groupName, inviteEmails }) {
@@ -254,6 +277,12 @@ export async function createChatRoomForTrip({ trip, adminUser, groupName, invite
     adminEmail,
     memberUids: [adminUser.uid],
     memberEmails: [adminEmail],
+    removedMemberUids: [],
+    removedMemberEmails: [],
+    leftMemberUids: [],
+    leftMemberEmails: [],
+    hiddenForUids: [],
+    memberEvents: [],
     lastReadBy: {
       [adminUser.uid]: serverTimestamp(),
     },
@@ -335,14 +364,25 @@ export async function listUserChatRooms(userId) {
   }
 
   const database = getDbInstance()
-  const roomsQuery = query(collection(database, 'chatRooms'), where('memberUids', 'array-contains', userId))
-  const snapshot = await getDocs(roomsQuery)
-  const rooms = snapshot.docs.map((roomDoc) => ({
-    id: roomDoc.id,
-    ...roomDoc.data(),
-  }))
+  const roomCollections = await Promise.all([
+    getDocs(query(collection(database, 'chatRooms'), where('memberUids', 'array-contains', userId))),
+    getDocs(query(collection(database, 'chatRooms'), where('removedMemberUids', 'array-contains', userId))),
+    getDocs(query(collection(database, 'chatRooms'), where('leftMemberUids', 'array-contains', userId))),
+  ])
 
-  return sortByCreatedAtDesc(rooms)
+  const roomsById = {}
+  roomCollections.forEach((snapshot) => {
+    snapshot.docs.forEach((roomDoc) => {
+      roomsById[roomDoc.id] = {
+        id: roomDoc.id,
+        ...roomDoc.data(),
+      }
+    })
+  })
+
+  return sortByCreatedAtDesc(
+    Object.values(roomsById).filter((room) => !(room.hiddenForUids || []).includes(userId)),
+  )
 }
 
 export async function listPendingChatInvitesForUser(userId) {
@@ -392,6 +432,11 @@ export async function acceptChatInvite({ inviteId, user }) {
   await updateDoc(roomRef, {
     memberUids: arrayUnion(user.uid),
     memberEmails: arrayUnion(normalizeEmail(user.email)),
+    removedMemberUids: arrayRemove(user.uid),
+    removedMemberEmails: arrayRemove(normalizeEmail(user.email)),
+    leftMemberUids: arrayRemove(user.uid),
+    leftMemberEmails: arrayRemove(normalizeEmail(user.email)),
+    hiddenForUids: arrayRemove(user.uid),
     [`lastReadBy.${user.uid}`]: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
@@ -401,7 +446,207 @@ export async function acceptChatInvite({ inviteId, user }) {
     updatedAt: serverTimestamp(),
   })
 
+  await createTripNotifications({
+    tripId: invite.tripId || '',
+    message: `You were added to ${invite.roomName || 'Trip Group'}.`,
+    recipientUids: [user.uid],
+    triggeredByUid: user.uid,
+    type: 'trip_group_added',
+    metadata: {
+      roomId: invite.roomId,
+    },
+  })
+
+  await sendSystemMessageToChatRoom({
+    roomId: invite.roomId,
+    user,
+    text: `${getAuthUserDisplayName(user)} was added to the group.`,
+    metadata: {
+      type: 'member_added',
+      userId: user.uid,
+      userEmail: normalizeEmail(user.email),
+      at: Date.now(),
+    },
+  })
+
   return invite.roomId
+}
+
+async function getRoomById(roomId) {
+  const database = getDbInstance()
+  const roomSnapshot = await getDoc(doc(database, 'chatRooms', roomId))
+  if (!roomSnapshot.exists()) {
+    throw new Error('Chat room not found.')
+  }
+  return {
+    id: roomSnapshot.id,
+    ...roomSnapshot.data(),
+  }
+}
+
+export async function removeChatRoomMember({ roomId, adminUser, member }) {
+  if (!roomId || !adminUser?.uid) {
+    throw new Error('Room and admin are required.')
+  }
+
+  const memberUid = String(member?.uid || '').trim()
+  const memberEmail = normalizeEmail(member?.email)
+  if (!memberUid) {
+    throw new Error('Member account is required.')
+  }
+
+  const room = await getRoomById(roomId)
+  if (room.adminUid !== adminUser.uid) {
+    throw new Error('Only the room admin can remove members.')
+  }
+  if (memberUid === room.adminUid) {
+    throw new Error('The room admin cannot be removed. Assigning another admin is not supported yet.')
+  }
+  if (!(room.memberUids || []).includes(memberUid)) {
+    throw new Error('This user is not an active member.')
+  }
+
+  const database = getDbInstance()
+  const roomRef = doc(database, 'chatRooms', roomId)
+  const event = {
+    type: 'removed',
+    userId: memberUid,
+    userEmail: memberEmail,
+    byUid: adminUser.uid,
+    byEmail: normalizeEmail(adminUser.email),
+    at: Date.now(),
+  }
+
+  await updateDoc(roomRef, {
+    memberUids: arrayRemove(memberUid),
+    memberEmails: memberEmail ? arrayRemove(memberEmail) : arrayRemove(''),
+    removedMemberUids: arrayUnion(memberUid),
+    removedMemberEmails: memberEmail ? arrayUnion(memberEmail) : arrayUnion(''),
+    leftMemberUids: arrayRemove(memberUid),
+    leftMemberEmails: memberEmail ? arrayRemove(memberEmail) : arrayRemove(''),
+    hiddenForUids: arrayRemove(memberUid),
+    memberEvents: arrayUnion(event),
+    updatedAt: serverTimestamp(),
+  })
+
+  await sendSystemMessageToChatRoom({
+    roomId,
+    user: adminUser,
+    text: `${member.name || memberEmail || 'A member'} was removed from this group by admin.`,
+    metadata: event,
+  })
+
+  await createTripNotifications({
+    tripId: room.tripId || '',
+    message: `You have been removed from ${room.roomName || 'this group'} by admin.`,
+    recipientUids: [memberUid],
+    triggeredByUid: adminUser.uid,
+    type: 'chat_member_removed',
+    metadata: {
+      roomId,
+      removedByUid: adminUser.uid,
+    },
+  })
+}
+
+export async function leaveChatRoom({ roomId, user }) {
+  if (!roomId || !user?.uid || !user?.email) {
+    throw new Error('Room and user are required.')
+  }
+
+  const room = await getRoomById(roomId)
+  if (!(room.memberUids || []).includes(user.uid)) {
+    throw new Error('You are not an active member of this room.')
+  }
+
+  const userEmail = normalizeEmail(user.email)
+  const memberUids = Array.isArray(room.memberUids) ? room.memberUids : []
+  const memberEmails = Array.isArray(room.memberEmails) ? room.memberEmails : []
+  const isLeavingAdmin = room.adminUid === user.uid
+  const remainingMemberUids = memberUids.filter((uid) => uid !== user.uid)
+  const nextAdminUid = isLeavingAdmin ? remainingMemberUids[0] || '' : String(room.adminUid || '')
+  const nextAdminIndex = nextAdminUid ? memberUids.indexOf(nextAdminUid) : -1
+  const nextAdminEmail = nextAdminUid
+    ? normalizeEmail(memberEmails[nextAdminIndex] || '')
+    : ''
+  let nextAdminName = nextAdminEmail ? getDisplayNameFromEmail(nextAdminEmail) : 'Another member'
+
+  if (nextAdminUid) {
+    try {
+      const nextAdminProfile = await getUserProfileByUid(nextAdminUid)
+      nextAdminName = resolveDisplayName({
+        displayName: nextAdminProfile?.displayName,
+        email: nextAdminProfile?.email || nextAdminEmail,
+      })
+    } catch {
+      nextAdminName = nextAdminEmail ? getDisplayNameFromEmail(nextAdminEmail) : 'Another member'
+    }
+  }
+
+  const database = getDbInstance()
+  const roomRef = doc(database, 'chatRooms', roomId)
+  const event = {
+    type: 'left',
+    userId: user.uid,
+    userEmail,
+    byUid: user.uid,
+    byEmail: userEmail,
+    at: Date.now(),
+  }
+
+  await sendSystemMessageToChatRoom({
+    roomId,
+    user,
+    text: `${getAuthUserDisplayName(user)} left the group.`,
+    metadata: event,
+  })
+
+  if (isLeavingAdmin && nextAdminUid) {
+    await sendSystemMessageToChatRoom({
+      roomId,
+      user,
+      text: `${nextAdminName} is now the group admin.`,
+      metadata: {
+        type: 'admin_promoted',
+        userId: nextAdminUid,
+        userEmail: nextAdminEmail,
+        previousAdminUid: user.uid,
+        at: Date.now(),
+      },
+    })
+  }
+
+  const updates = {
+    memberUids: arrayRemove(user.uid),
+    memberEmails: arrayRemove(userEmail),
+    leftMemberUids: arrayUnion(user.uid),
+    leftMemberEmails: arrayUnion(userEmail),
+    memberEvents: arrayUnion(event),
+    updatedAt: serverTimestamp(),
+  }
+
+  if (isLeavingAdmin) {
+    updates.adminUid = nextAdminUid
+    updates.adminEmail = nextAdminEmail
+  }
+
+  if (remainingMemberUids.length === 0) {
+    updates.hiddenForUids = arrayUnion(user.uid)
+  }
+
+  await updateDoc(roomRef, updates)
+}
+
+export async function hideChatRoomForUser({ roomId, userId }) {
+  if (!roomId || !userId) {
+    return
+  }
+
+  const database = getDbInstance()
+  await updateDoc(doc(database, 'chatRooms', roomId), {
+    hiddenForUids: arrayUnion(userId),
+    updatedAt: serverTimestamp(),
+  })
 }
 
 export async function sendMessageToChatRoom({ roomId, user, text, file = null, authorName = '' }) {
@@ -423,6 +668,11 @@ export async function sendMessageToChatRoom({ roomId, user, text, file = null, a
     getDisplayNameFromEmail(user.email)
 
   const database = getDbInstance()
+  const room = await getRoomById(roomId)
+  if (!(room.memberUids || []).includes(user.uid)) {
+    throw new Error('You are no longer a member of this chat room.')
+  }
+
   const attachment = await uploadChatAttachment({
     roomId,
     userId: user.uid,
@@ -570,23 +820,63 @@ export function subscribeToUserChatRooms({ userId, onRooms, onError }) {
   }
 
   const database = getDbInstance()
-  const roomsQuery = query(collection(database, 'chatRooms'), where('memberUids', 'array-contains', userId))
+  const roomSources = [
+    {
+      key: 'active',
+      queryRef: query(collection(database, 'chatRooms'), where('memberUids', 'array-contains', userId)),
+    },
+    {
+      key: 'removed',
+      queryRef: query(collection(database, 'chatRooms'), where('removedMemberUids', 'array-contains', userId)),
+    },
+    {
+      key: 'left',
+      queryRef: query(collection(database, 'chatRooms'), where('leftMemberUids', 'array-contains', userId)),
+    },
+  ]
+  const roomsBySource = Object.fromEntries(roomSources.map((source) => [source.key, {}]))
 
-  return onSnapshot(
-    roomsQuery,
-    (snapshot) => {
-      const rooms = snapshot.docs.map((roomDoc) => ({
-        id: roomDoc.id,
-        ...roomDoc.data(),
-      }))
-      onRooms(sortByCreatedAtDesc(rooms))
-    },
-    (error) => {
-      if (onError) {
-        onError(error)
-      }
-    },
+  function emitMergedRooms() {
+    const roomsById = {}
+    Object.values(roomsBySource).forEach((sourceRooms) => {
+      Object.entries(sourceRooms).forEach(([roomId, room]) => {
+        roomsById[roomId] = room
+      })
+    })
+
+    onRooms(
+      sortByCreatedAtDesc(
+        Object.values(roomsById).filter((room) => !(room.hiddenForUids || []).includes(userId)),
+      ),
+    )
+  }
+
+  const unsubscribers = roomSources.map((source) =>
+    onSnapshot(
+      source.queryRef,
+      (snapshot) => {
+        roomsBySource[source.key] = Object.fromEntries(
+          snapshot.docs.map((roomDoc) => [
+            roomDoc.id,
+            {
+              id: roomDoc.id,
+              ...roomDoc.data(),
+            },
+          ]),
+        )
+        emitMergedRooms()
+      },
+      (error) => {
+        if (onError) {
+          onError(error)
+        }
+      },
+    ),
   )
+
+  return () => {
+    unsubscribers.forEach((unsubscribe) => unsubscribe())
+  }
 }
 
 export function subscribeToChatRoomMessages({ roomId, onMessages, onError }) {

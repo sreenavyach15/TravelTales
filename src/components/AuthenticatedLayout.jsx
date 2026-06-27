@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useRef } from 'react'
 import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { changePassword, logoutUser } from '../services/authService'
 import {
@@ -7,6 +7,7 @@ import {
   subscribeToUserChatRooms,
 } from '../services/chatService'
 import {
+  ensureUpcomingTripReminderNotifications,
   markAllTripNotificationsAsRead,
   subscribeToTripNotifications,
 } from '../services/tripNotificationService'
@@ -69,6 +70,11 @@ function AuthenticatedLayout({ userEmail, userUid }) {
   const navigate = useNavigate()
   const [showNotifications, setShowNotifications] = useState(false)
   const [showProfilePanel, setShowProfilePanel] = useState(false)
+
+  const profilePanelRef = useRef(null)
+  const profileButtonRef = useRef(null)
+  const notificationPanelRef = useRef(null)
+  const notificationButtonRef = useRef(null)
 
   const [layoutStatus, setLayoutStatus] = useState('')
   const [layoutError, setLayoutError] = useState('')
@@ -188,12 +194,74 @@ function AuthenticatedLayout({ userEmail, userUid }) {
       },
     })
 
+    ensureUpcomingTripReminderNotifications(userUid).catch(() => {
+      // Reminder creation should never block the main layout.
+    })
+
     return () => {
       unsubscribeInvites()
       unsubscribeRooms()
       unsubscribeTripNotifications()
     }
   }, [userUid])
+
+  useEffect(() => {
+    if (!showProfilePanel) return undefined
+
+    function handleDocumentMouseDown(e) {
+      if (!profilePanelRef.current || !profileButtonRef.current) return
+      const target = e.target
+      if (
+        profilePanelRef.current.contains(target) ||
+        profileButtonRef.current.contains(target)
+      ) {
+        return
+      }
+      setShowProfilePanel(false)
+    }
+
+    function handleEscapeKey(e) {
+      if (e.key === 'Escape') {
+        setShowProfilePanel(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleDocumentMouseDown)
+    document.addEventListener('keydown', handleEscapeKey)
+    return () => {
+      document.removeEventListener('mousedown', handleDocumentMouseDown)
+      document.removeEventListener('keydown', handleEscapeKey)
+    }
+  }, [showProfilePanel])
+
+  useEffect(() => {
+    if (!showNotifications) return undefined
+
+    function handleDocumentMouseDown(e) {
+      if (!notificationPanelRef.current || !notificationButtonRef.current) return
+      const target = e.target
+      if (
+        notificationPanelRef.current.contains(target) ||
+        notificationButtonRef.current.contains(target)
+      ) {
+        return
+      }
+      setShowNotifications(false)
+    }
+
+    function handleEscapeKey(e) {
+      if (e.key === 'Escape') {
+        setShowNotifications(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleDocumentMouseDown)
+    document.addEventListener('keydown', handleEscapeKey)
+    return () => {
+      document.removeEventListener('mousedown', handleDocumentMouseDown)
+      document.removeEventListener('keydown', handleEscapeKey)
+    }
+  }, [showNotifications])
 
   const handleLogout = async () => {
     setLayoutStatus('')
@@ -314,6 +382,7 @@ function AuthenticatedLayout({ userEmail, userUid }) {
           <div className="relative flex items-center justify-end gap-3">
             <button
               type="button"
+              ref={notificationButtonRef}
               onClick={async () => {
                 setShowNotifications((previous) => !previous)
                 setShowProfilePanel(false)
@@ -337,6 +406,7 @@ function AuthenticatedLayout({ userEmail, userUid }) {
 
             <button
               type="button"
+              ref={profileButtonRef}
               onClick={() => {
                 setShowProfilePanel((previous) => !previous)
                 setShowNotifications(false)
@@ -349,7 +419,7 @@ function AuthenticatedLayout({ userEmail, userUid }) {
             </button>
 
             {showNotifications && (
-              <div className="absolute right-0 top-11 z-20 w-80 rounded-lg border border-slate-200 bg-white p-3 shadow-lg">
+              <div ref={notificationPanelRef} className="absolute right-0 top-11 z-20 w-80 rounded-lg border border-slate-200 bg-white p-3 shadow-lg">
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                   Notifications
                 </p>
@@ -413,7 +483,7 @@ function AuthenticatedLayout({ userEmail, userUid }) {
             )}
 
             {showProfilePanel && (
-              <div className="absolute right-0 top-11 z-20 w-[28rem] rounded-lg border border-slate-200 bg-white p-4 shadow-lg">
+              <div ref={profilePanelRef} className="absolute right-0 top-11 z-20 w-[28rem] rounded-lg border border-slate-200 bg-white p-4 shadow-lg">
                 <h3 className="text-base font-semibold text-slate-900">Profile</h3>
                 <p className="mt-1 text-xs text-slate-500">Manage your account details and security.</p>
 
